@@ -5,6 +5,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.atomic.*;
 import java.util.function.*;
@@ -196,6 +197,19 @@ class ReactiveGatherersTest {
         @DisplayName("invalid timespan throws")
         void invalidTimespan() {
             assertThrows(IllegalArgumentException.class, () -> bufferTime(0, TimedEvent::ts));
+        }
+
+        @Test
+        @DisplayName("large input bufferTime performance")
+        void largeInputPerformance() {
+            assertTimeoutPreemptively(Duration.ofSeconds(5), () ->
+                    Stream.iterate(0, i -> i + 1).limit(100_000)
+                            .map(i -> new TimedEvent(i, "v"))
+                            .gather(bufferTime(1000, TimedEvent::ts))
+                            .skip(99)
+                            .limit(1)
+                            .toList()
+            );
         }
     }
 
@@ -513,6 +527,34 @@ class ReactiveGatherersTest {
                             e -> List.of(-1)))
                     .toList();
             assertEquals(List.of(50, 25), result);
+        }
+
+        @Test
+        @DisplayName("replaces each mapping error with fallback values from the factory")
+        void replacesMappingErrorsWithFallback() {
+            List<String> result = Stream.of("ok", "boom", "fine")
+                    .gather(onErrorResume(
+                            s -> {
+                                if (s.equals("boom")) throw new RuntimeException("explosion");
+                                return s.toUpperCase();
+                            },
+                            e -> List.of("FALLBACK:" + e.getMessage())
+                    ))
+                    .toList();
+            assertEquals(List.of("OK", "FALLBACK:explosion", "FINE"), result);
+        }
+
+        @Test
+        @DisplayName("short-circuits fallback emission when downstream refuses")
+        void shortCircuitsFallbackEmission() {
+            List<String> result = Stream.of("boom")
+                    .gather(onErrorResume(
+                            s -> { throw new RuntimeException("fail"); },
+                            e -> List.of("a", "b", "c")
+                    ))
+                    .limit(1)
+                    .toList();
+            assertEquals(List.of("a"), result);
         }
     }
 
@@ -1242,44 +1284,6 @@ class ReactiveGatherersTest {
     }
 
     // ═══════════════════════════════════════════════
-    //  Missing branch coverage tests
-    // ═══════════════════════════════════════════════
-
-    @Nested
-    @DisplayName("Missing branch coverage")
-    class MissingBranchCoverageTest {
-
-        @Test
-        @DisplayName("onErrorResume catch branch — mapper throws, fallback is used")
-        void onErrorResumeCatchBranch() {
-            // The catch branch in onErrorResume: mapper throws, fallbackFactory is called
-            List<String> result = Stream.of("ok", "boom", "fine")
-                    .gather(onErrorResume(
-                            s -> {
-                                if (s.equals("boom")) throw new RuntimeException("explosion");
-                                return s.toUpperCase();
-                            },
-                            e -> List.of("FALLBACK:" + e.getMessage())
-                    ))
-                    .toList();
-            assertEquals(List.of("OK", "FALLBACK:explosion", "FINE"), result);
-        }
-
-        @Test
-        @DisplayName("onErrorResume fallback with short-circuit (downstream.push returns false)")
-        void onErrorResumeShortCircuit() {
-            List<String> result = Stream.of("boom")
-                    .gather(onErrorResume(
-                            s -> { throw new RuntimeException("fail"); },
-                            e -> List.of("a", "b", "c")
-                    ))
-                    .limit(1)
-                    .toList();
-            assertEquals(List.of("a"), result);
-        }
-    }
-
-    // ═══════════════════════════════════════════════
     //  Additional behavior (null values, out-of-order timestamps, etc.)
     // ═══════════════════════════════════════════════
 
@@ -1764,6 +1768,16 @@ class ReactiveGatherersTest {
                     .limit(2)
                     .toList();
             assertEquals(List.of(1, 2), result);
+        }
+
+        @Test
+        @DisplayName("distinctUntilChanged with key selector respects limit")
+        void distinctUntilChangedKeySelectorLimit() {
+            List<String> result = Stream.of("a", "b", "aa", "bb", "c")
+                    .gather(distinctUntilChanged(String::length))
+                    .limit(2)
+                    .toList();
+            assertEquals(List.of("a", "aa"), result);
         }
 
         @Test

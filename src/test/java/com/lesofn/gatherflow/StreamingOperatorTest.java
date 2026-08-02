@@ -35,15 +35,23 @@ class StreamingOperatorTest {
     /**
      * Creates a Stream that reads from a BlockingQueue.
      * {@code Optional.empty()} signals end-of-stream.
+     * <p>The optional {@code consumed} latch is counted down once per element
+     * consumed by the stream, allowing tests to wait deterministically for
+     * processing without arbitrary sleeps.</p>
      */
-    static <T> Stream<T> streamFromQueue(BlockingQueue<Optional<T>> queue) {
-        Spliterator<T> spliterator = new Spliterator<T>() {
+    static <T> Stream<T> streamFromQueue(BlockingQueue<Optional<T>> queue,
+                                          AtomicReference<CountDownLatch> consumed) {
+        Spliterator<T> spliterator = new Spliterator<>() {
             @Override
             public boolean tryAdvance(Consumer<? super T> action) {
                 try {
                     Optional<T> item = queue.take();
                     if (item.isEmpty()) return false;
                     action.accept(item.get());
+                    CountDownLatch latch = consumed == null ? null : consumed.get();
+                    if (latch != null) {
+                        latch.countDown();
+                    }
                     return true;
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
@@ -63,6 +71,10 @@ class StreamingOperatorTest {
         return StreamSupport.stream(spliterator, false);
     }
 
+    static <T> Stream<T> streamFromQueue(BlockingQueue<Optional<T>> queue) {
+        return streamFromQueue(queue, null);
+    }
+
     /**
      * Feeds elements into the queue and signals end-of-stream.
      */
@@ -75,6 +87,35 @@ class StreamingOperatorTest {
             queue.put(Optional.empty());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        }
+    }
+
+    static void expectConsumed(AtomicReference<CountDownLatch> consumed, int count) {
+        consumed.set(new CountDownLatch(count));
+    }
+
+    static void awaitConsumed(AtomicReference<CountDownLatch> consumed) throws InterruptedException {
+        CountDownLatch latch = consumed.get();
+        assertTrue(latch.await(2, TimeUnit.SECONDS), "expected elements to be consumed");
+    }
+
+    // ═══════════════════════════════════════════════
+    //  streamFromQueue characteristics
+    // ═══════════════════════════════════════════════
+
+    @Nested
+    @DisplayName("streamFromQueue")
+    class StreamFromQueueTest {
+
+        @Test
+        @DisplayName("trySplit returns null and characteristics include NONNULL")
+        void spliteratorCharacteristics() {
+            BlockingQueue<Optional<String>> queue = new LinkedBlockingQueue<>();
+            Spliterator<String> spliterator = streamFromQueue(queue).spliterator();
+
+            assertNull(spliterator.trySplit());
+            assertTrue(spliterator.hasCharacteristics(Spliterator.ORDERED));
+            assertTrue(spliterator.hasCharacteristics(Spliterator.NONNULL));
         }
     }
 
@@ -91,31 +132,33 @@ class StreamingOperatorTest {
         void emitsIncrementally() throws Exception {
             BlockingQueue<Optional<TimedEvent>> queue = new LinkedBlockingQueue<>();
             List<TimedEvent> results = new CopyOnWriteArrayList<>();
+            AtomicReference<CountDownLatch> consumed = new AtomicReference<>(new CountDownLatch(0));
             CountDownLatch done = new CountDownLatch(1);
 
             Thread.startVirtualThread(() -> {
-                streamFromQueue(queue)
+                streamFromQueue(queue, consumed)
                     .gather(throttleLast(100, TimedEvent::ts))
                     .forEach(results::add);
                 done.countDown();
             });
 
             // Feed bucket 0
+            expectConsumed(consumed, 2);
             queue.put(Optional.of(new TimedEvent(0, "a")));
             queue.put(Optional.of(new TimedEvent(50, "b")));
-            Thread.sleep(50);
+            awaitConsumed(consumed);
             // No results yet — bucket 0 not complete
-            assertEquals(0, results.size());
+            assertEquals(List.of(), new ArrayList<>(results));
 
             // Feed bucket 1 — should trigger emission of bucket 0
+            expectConsumed(consumed, 1);
             queue.put(Optional.of(new TimedEvent(100, "c")));
-            Thread.sleep(50);
-            assertEquals(1, results.size());
-            assertEquals(new TimedEvent(50, "b"), results.get(0)); // last of bucket 0
+            awaitConsumed(consumed);
+            assertEquals(List.of(new TimedEvent(50, "b")), new ArrayList<>(results));
 
             // End stream — finisher emits bucket 1
             queue.put(Optional.empty());
-            done.await(5, TimeUnit.SECONDS);
+            assertTrue(done.await(2, TimeUnit.SECONDS));
             assertEquals(List.of(new TimedEvent(50, "b"), new TimedEvent(100, "c")),
                     new ArrayList<>(results));
         }
@@ -130,30 +173,33 @@ class StreamingOperatorTest {
         void emitsIncrementally() throws Exception {
             BlockingQueue<Optional<TimedEvent>> queue = new LinkedBlockingQueue<>();
             List<List<TimedEvent>> results = new CopyOnWriteArrayList<>();
+            AtomicReference<CountDownLatch> consumed = new AtomicReference<>(new CountDownLatch(0));
             CountDownLatch done = new CountDownLatch(1);
 
             Thread.startVirtualThread(() -> {
-                streamFromQueue(queue)
+                streamFromQueue(queue, consumed)
                     .gather(bufferTime(100, TimedEvent::ts))
                     .forEach(results::add);
                 done.countDown();
             });
 
             // Feed bucket 0
+            expectConsumed(consumed, 2);
             queue.put(Optional.of(new TimedEvent(10, "a")));
             queue.put(Optional.of(new TimedEvent(50, "b")));
-            Thread.sleep(50);
-            assertEquals(0, results.size()); // bucket 0 not complete
+            awaitConsumed(consumed);
+            assertEquals(List.of(), new ArrayList<>(results));
 
             // Feed bucket 1 — should trigger emission of bucket 0
+            expectConsumed(consumed, 1);
             queue.put(Optional.of(new TimedEvent(110, "c")));
-            Thread.sleep(50);
-            assertEquals(1, results.size());
-            assertEquals(List.of(new TimedEvent(10, "a"), new TimedEvent(50, "b")), results.get(0));
+            awaitConsumed(consumed);
+            assertEquals(List.of(List.of(
+                    new TimedEvent(10, "a"), new TimedEvent(50, "b"))), new ArrayList<>(results));
 
             // End stream
             queue.put(Optional.empty());
-            done.await(5, TimeUnit.SECONDS);
+            assertTrue(done.await(2, TimeUnit.SECONDS));
             assertEquals(2, results.size());
             assertEquals(List.of(new TimedEvent(110, "c")), results.get(1));
         }
@@ -168,24 +214,27 @@ class StreamingOperatorTest {
         void emitsIncrementally() throws Exception {
             BlockingQueue<Optional<TimedEvent>> queue = new LinkedBlockingQueue<>();
             List<Window<TimedEvent>> results = new CopyOnWriteArrayList<>();
+            AtomicReference<CountDownLatch> consumed = new AtomicReference<>(new CountDownLatch(0));
             CountDownLatch done = new CountDownLatch(1);
 
             Thread.startVirtualThread(() -> {
-                streamFromQueue(queue)
+                streamFromQueue(queue, consumed)
                     .gather(tumblingTimeWindow(100, TimedEvent::ts))
                     .forEach(results::add);
                 done.countDown();
             });
 
             // Feed window [0-99]
+            expectConsumed(consumed, 2);
             queue.put(Optional.of(new TimedEvent(10, "a")));
             queue.put(Optional.of(new TimedEvent(50, "b")));
-            Thread.sleep(50);
-            assertEquals(0, results.size()); // window not complete
+            awaitConsumed(consumed);
+            assertEquals(List.of(), new ArrayList<>(results));
 
             // Feed window [100-199] — should trigger emission of window [0-99]
+            expectConsumed(consumed, 1);
             queue.put(Optional.of(new TimedEvent(110, "c")));
-            Thread.sleep(50);
+            awaitConsumed(consumed);
             assertEquals(1, results.size());
             assertEquals(0, results.get(0).startIndex());
             assertEquals(99, results.get(0).endIndex());
@@ -193,7 +242,7 @@ class StreamingOperatorTest {
 
             // End stream
             queue.put(Optional.empty());
-            done.await(5, TimeUnit.SECONDS);
+            assertTrue(done.await(2, TimeUnit.SECONDS));
             assertEquals(2, results.size());
             assertEquals(100, results.get(1).startIndex());
         }
@@ -208,30 +257,32 @@ class StreamingOperatorTest {
         void emitsOnGap() throws Exception {
             BlockingQueue<Optional<TimedEvent>> queue = new LinkedBlockingQueue<>();
             List<TimedEvent> results = new CopyOnWriteArrayList<>();
+            AtomicReference<CountDownLatch> consumed = new AtomicReference<>(new CountDownLatch(0));
             CountDownLatch done = new CountDownLatch(1);
 
             Thread.startVirtualThread(() -> {
-                streamFromQueue(queue)
+                streamFromQueue(queue, consumed)
                     .gather(debounce(50, TimedEvent::ts))
                     .forEach(results::add);
                 done.countDown();
             });
 
             // Feed elements within timeout
+            expectConsumed(consumed, 2);
             queue.put(Optional.of(new TimedEvent(0, "a")));
-            queue.put(Optional.of(new TimedEvent(30, "b"))); // gap=30 < 50, not emitted
-            Thread.sleep(50);
-            assertEquals(0, results.size()); // no gap exceeded yet
+            queue.put(Optional.of(new TimedEvent(30, "b")));
+            awaitConsumed(consumed);
+            assertEquals(List.of(), new ArrayList<>(results));
 
             // Feed element with gap > timeout — should emit "b" (pending)
-            queue.put(Optional.of(new TimedEvent(100, "c"))); // gap=70 > 50
-            Thread.sleep(50);
-            assertEquals(1, results.size());
-            assertEquals(new TimedEvent(30, "b"), results.get(0));
+            expectConsumed(consumed, 1);
+            queue.put(Optional.of(new TimedEvent(100, "c")));
+            awaitConsumed(consumed);
+            assertEquals(List.of(new TimedEvent(30, "b")), new ArrayList<>(results));
 
             // End stream — finisher emits "c"
             queue.put(Optional.empty());
-            done.await(5, TimeUnit.SECONDS);
+            assertTrue(done.await(2, TimeUnit.SECONDS));
             assertEquals(List.of(new TimedEvent(30, "b"), new TimedEvent(100, "c")),
                     new ArrayList<>(results));
         }
@@ -246,30 +297,33 @@ class StreamingOperatorTest {
         void emitsOnGap() throws Exception {
             BlockingQueue<Optional<TimedEvent>> queue = new LinkedBlockingQueue<>();
             List<Window<TimedEvent>> results = new CopyOnWriteArrayList<>();
+            AtomicReference<CountDownLatch> consumed = new AtomicReference<>(new CountDownLatch(0));
             CountDownLatch done = new CountDownLatch(1);
 
             Thread.startVirtualThread(() -> {
-                streamFromQueue(queue)
+                streamFromQueue(queue, consumed)
                     .gather(sessionWindow(5, TimedEvent::ts))
                     .forEach(results::add);
                 done.countDown();
             });
 
             // Feed elements within session
+            expectConsumed(consumed, 2);
             queue.put(Optional.of(new TimedEvent(1, "a")));
             queue.put(Optional.of(new TimedEvent(3, "b")));
-            Thread.sleep(50);
-            assertEquals(0, results.size()); // session not closed
+            awaitConsumed(consumed);
+            assertEquals(List.of(), new ArrayList<>(results));
 
             // Feed element with gap > 5 — should close session 0
+            expectConsumed(consumed, 1);
             queue.put(Optional.of(new TimedEvent(20, "c")));
-            Thread.sleep(50);
+            awaitConsumed(consumed);
             assertEquals(1, results.size());
             assertEquals(2, results.get(0).size());
 
             // End stream — finisher emits session 1
             queue.put(Optional.empty());
-            done.await(5, TimeUnit.SECONDS);
+            assertTrue(done.await(2, TimeUnit.SECONDS));
             assertEquals(2, results.size());
         }
     }
@@ -287,24 +341,26 @@ class StreamingOperatorTest {
         void foldLeftNoIntermediate() throws Exception {
             BlockingQueue<Optional<Integer>> queue = new LinkedBlockingQueue<>();
             List<Integer> results = new CopyOnWriteArrayList<>();
+            AtomicReference<CountDownLatch> consumed = new AtomicReference<>(new CountDownLatch(0));
             CountDownLatch done = new CountDownLatch(1);
 
             Thread.startVirtualThread(() -> {
-                streamFromQueue(queue)
+                streamFromQueue(queue, consumed)
                     .gather(foldLeft(0, Integer::sum))
                     .forEach(results::add);
                 done.countDown();
             });
 
+            expectConsumed(consumed, 3);
             queue.put(Optional.of(1));
             queue.put(Optional.of(2));
             queue.put(Optional.of(3));
-            Thread.sleep(100);
+            awaitConsumed(consumed);
             // No results yet — foldLeft only emits in finisher
-            assertEquals(0, results.size());
+            assertEquals(List.of(), new ArrayList<>(results));
 
             queue.put(Optional.empty());
-            done.await(5, TimeUnit.SECONDS);
+            assertTrue(done.await(2, TimeUnit.SECONDS));
             assertEquals(List.of(6), new ArrayList<>(results));
         }
 
@@ -313,22 +369,24 @@ class StreamingOperatorTest {
         void reverseNoIntermediate() throws Exception {
             BlockingQueue<Optional<String>> queue = new LinkedBlockingQueue<>();
             List<String> results = new CopyOnWriteArrayList<>();
+            AtomicReference<CountDownLatch> consumed = new AtomicReference<>(new CountDownLatch(0));
             CountDownLatch done = new CountDownLatch(1);
 
             Thread.startVirtualThread(() -> {
-                streamFromQueue(queue)
+                streamFromQueue(queue, consumed)
                     .gather(reverse())
                     .forEach(results::add);
                 done.countDown();
             });
 
+            expectConsumed(consumed, 2);
             queue.put(Optional.of("a"));
             queue.put(Optional.of("b"));
-            Thread.sleep(100);
-            assertEquals(0, results.size()); // no intermediate results
+            awaitConsumed(consumed);
+            assertEquals(List.of(), new ArrayList<>(results));
 
             queue.put(Optional.empty());
-            done.await(5, TimeUnit.SECONDS);
+            assertTrue(done.await(2, TimeUnit.SECONDS));
             assertEquals(List.of("b", "a"), new ArrayList<>(results));
         }
 
@@ -337,22 +395,24 @@ class StreamingOperatorTest {
         void lastNoIntermediate() throws Exception {
             BlockingQueue<Optional<String>> queue = new LinkedBlockingQueue<>();
             List<Optional<String>> results = new CopyOnWriteArrayList<>();
+            AtomicReference<CountDownLatch> consumed = new AtomicReference<>(new CountDownLatch(0));
             CountDownLatch done = new CountDownLatch(1);
 
             Thread.startVirtualThread(() -> {
-                streamFromQueue(queue)
+                streamFromQueue(queue, consumed)
                     .gather(ReactiveGatherers.last())
                     .forEach(results::add);
                 done.countDown();
             });
 
+            expectConsumed(consumed, 2);
             queue.put(Optional.of("a"));
             queue.put(Optional.of("b"));
-            Thread.sleep(100);
-            assertEquals(0, results.size());
+            awaitConsumed(consumed);
+            assertEquals(List.of(), new ArrayList<>(results));
 
             queue.put(Optional.empty());
-            done.await(5, TimeUnit.SECONDS);
+            assertTrue(done.await(2, TimeUnit.SECONDS));
             assertEquals(List.of(Optional.of("b")), new ArrayList<>(results));
         }
 
@@ -361,24 +421,25 @@ class StreamingOperatorTest {
         void slidingTimeWindowNoIntermediate() throws Exception {
             BlockingQueue<Optional<TimedEvent>> queue = new LinkedBlockingQueue<>();
             List<Window<TimedEvent>> results = new CopyOnWriteArrayList<>();
+            AtomicReference<CountDownLatch> consumed = new AtomicReference<>(new CountDownLatch(0));
             CountDownLatch done = new CountDownLatch(1);
 
             Thread.startVirtualThread(() -> {
-                streamFromQueue(queue)
+                streamFromQueue(queue, consumed)
                     .gather(slidingTimeWindow(100, 50, TimedEvent::ts))
                     .forEach(results::add);
                 done.countDown();
             });
 
+            expectConsumed(consumed, 3);
             queue.put(Optional.of(new TimedEvent(0, "a")));
             queue.put(Optional.of(new TimedEvent(50, "b")));
             queue.put(Optional.of(new TimedEvent(100, "c")));
-            Thread.sleep(100);
-            // slidingTimeWindow only emits in finisher — needs all data for overlapping windows
-            assertEquals(0, results.size());
+            awaitConsumed(consumed);
+            assertEquals(List.of(), new ArrayList<>(results));
 
             queue.put(Optional.empty());
-            done.await(5, TimeUnit.SECONDS);
+            assertTrue(done.await(2, TimeUnit.SECONDS));
             assertFalse(results.isEmpty());
         }
     }
@@ -396,33 +457,34 @@ class StreamingOperatorTest {
         void throttleFirstStreaming() throws Exception {
             BlockingQueue<Optional<TimedEvent>> queue = new LinkedBlockingQueue<>();
             List<TimedEvent> results = new CopyOnWriteArrayList<>();
+            AtomicReference<CountDownLatch> consumed = new AtomicReference<>(new CountDownLatch(0));
             CountDownLatch done = new CountDownLatch(1);
 
             Thread.startVirtualThread(() -> {
-                streamFromQueue(queue)
+                streamFromQueue(queue, consumed)
                     .gather(throttleFirst(100, TimedEvent::ts))
                     .forEach(results::add);
                 done.countDown();
             });
 
-            // First element in bucket 0 — should emit immediately
+            expectConsumed(consumed, 1);
             queue.put(Optional.of(new TimedEvent(0, "a")));
-            Thread.sleep(50);
-            assertEquals(1, results.size());
-            assertEquals(new TimedEvent(0, "a"), results.get(0));
+            awaitConsumed(consumed);
+            assertEquals(List.of(new TimedEvent(0, "a")), new ArrayList<>(results));
 
-            // Second element in bucket 0 — suppressed
+            expectConsumed(consumed, 1);
             queue.put(Optional.of(new TimedEvent(50, "b")));
-            Thread.sleep(50);
-            assertEquals(1, results.size()); // still just "a"
+            awaitConsumed(consumed);
+            assertEquals(List.of(new TimedEvent(0, "a")), new ArrayList<>(results));
 
-            // First element in bucket 1 — should emit
+            expectConsumed(consumed, 1);
             queue.put(Optional.of(new TimedEvent(100, "c")));
-            Thread.sleep(50);
-            assertEquals(2, results.size());
+            awaitConsumed(consumed);
+            assertEquals(List.of(new TimedEvent(0, "a"), new TimedEvent(100, "c")),
+                    new ArrayList<>(results));
 
             queue.put(Optional.empty());
-            done.await(5, TimeUnit.SECONDS);
+            assertTrue(done.await(2, TimeUnit.SECONDS));
         }
 
         @Test
@@ -430,58 +492,70 @@ class StreamingOperatorTest {
         void tumblingWindowStreaming() throws Exception {
             BlockingQueue<Optional<Integer>> queue = new LinkedBlockingQueue<>();
             List<Window<Integer>> results = new CopyOnWriteArrayList<>();
+            AtomicReference<CountDownLatch> consumed = new AtomicReference<>(new CountDownLatch(0));
             CountDownLatch done = new CountDownLatch(1);
 
             Thread.startVirtualThread(() -> {
-                streamFromQueue(queue)
+                streamFromQueue(queue, consumed)
                     .gather(tumblingWindow(2))
                     .forEach(results::add);
                 done.countDown();
             });
 
+            expectConsumed(consumed, 1);
             queue.put(Optional.of(1));
-            Thread.sleep(50);
-            assertEquals(0, results.size()); // window not full
+            awaitConsumed(consumed);
+            assertEquals(List.of(), new ArrayList<>(results));
 
+            expectConsumed(consumed, 1);
             queue.put(Optional.of(2));
-            Thread.sleep(50);
-            assertEquals(1, results.size()); // window full, emitted
+            awaitConsumed(consumed);
+            assertEquals(1, results.size());
 
+            expectConsumed(consumed, 1);
             queue.put(Optional.of(3));
-            Thread.sleep(50);
-            assertEquals(1, results.size()); // next window not full
+            awaitConsumed(consumed);
+            assertEquals(1, results.size());
 
             queue.put(Optional.empty());
-            done.await(5, TimeUnit.SECONDS);
-            assertEquals(2, results.size()); // partial window emitted in finisher
+            assertTrue(done.await(2, TimeUnit.SECONDS));
+            assertEquals(2, results.size());
         }
 
         @Test
-        @DisplayName("grouped emits when group fills")
+        @DisplayName("grouped emits full groups and finisher emits the partial remainder")
         void groupedStreaming() throws Exception {
             BlockingQueue<Optional<Integer>> queue = new LinkedBlockingQueue<>();
             List<List<Integer>> results = new CopyOnWriteArrayList<>();
+            AtomicReference<CountDownLatch> consumed = new AtomicReference<>(new CountDownLatch(0));
             CountDownLatch done = new CountDownLatch(1);
 
             Thread.startVirtualThread(() -> {
-                streamFromQueue(queue)
+                streamFromQueue(queue, consumed)
                     .gather(grouped(2))
                     .forEach(results::add);
                 done.countDown();
             });
 
+            expectConsumed(consumed, 1);
             queue.put(Optional.of(1));
-            Thread.sleep(50);
-            assertEquals(0, results.size());
+            awaitConsumed(consumed);
+            assertEquals(List.of(), new ArrayList<>(results));
 
+            expectConsumed(consumed, 1);
             queue.put(Optional.of(2));
-            Thread.sleep(50);
-            assertEquals(1, results.size());
-            assertEquals(List.of(1, 2), results.get(0));
+            awaitConsumed(consumed);
+            assertEquals(List.of(List.of(1, 2)), new ArrayList<>(results));
+
+            // Odd element: remains buffered until the stream ends
+            expectConsumed(consumed, 1);
+            queue.put(Optional.of(3));
+            awaitConsumed(consumed);
+            assertEquals(List.of(List.of(1, 2)), new ArrayList<>(results));
 
             queue.put(Optional.empty());
-            done.await(5, TimeUnit.SECONDS);
-            assertEquals(1, results.size()); // no partial group
+            assertTrue(done.await(2, TimeUnit.SECONDS));
+            assertEquals(List.of(List.of(1, 2), List.of(3)), new ArrayList<>(results));
         }
 
         @Test
@@ -489,31 +563,29 @@ class StreamingOperatorTest {
         void scanLeftStreaming() throws Exception {
             BlockingQueue<Optional<Integer>> queue = new LinkedBlockingQueue<>();
             List<Integer> results = new CopyOnWriteArrayList<>();
+            AtomicReference<CountDownLatch> consumed = new AtomicReference<>(new CountDownLatch(0));
             CountDownLatch done = new CountDownLatch(1);
 
             Thread.startVirtualThread(() -> {
-                streamFromQueue(queue)
+                streamFromQueue(queue, consumed)
                     .gather(scanLeft(0, Integer::sum))
                     .forEach(results::add);
                 done.countDown();
             });
 
+            expectConsumed(consumed, 1);
             queue.put(Optional.of(1));
-            Thread.sleep(50);
-            // scanLeft emits initial value (0) then first step (0+1=1)
-            assertEquals(2, results.size());
-            assertEquals(0, results.get(0)); // initial value
-            assertEquals(1, results.get(1)); // first step
+            awaitConsumed(consumed);
+            assertEquals(List.of(0, 1), new ArrayList<>(results));
 
+            expectConsumed(consumed, 1);
             queue.put(Optional.of(2));
-            Thread.sleep(50);
-            assertEquals(3, results.size());
-            assertEquals(3, results.get(2)); // 1+2=3
+            awaitConsumed(consumed);
+            assertEquals(List.of(0, 1, 3), new ArrayList<>(results));
 
             queue.put(Optional.empty());
-            done.await(5, TimeUnit.SECONDS);
-            // No additional emission — initial was already emitted in integrator
-            assertEquals(3, results.size());
+            assertTrue(done.await(2, TimeUnit.SECONDS));
+            assertEquals(List.of(0, 1, 3), new ArrayList<>(results));
         }
     }
 }

@@ -91,6 +91,18 @@ class WindowGatherersTest {
         void invalidSize() {
             assertThrows(IllegalArgumentException.class, () -> tumblingWindow(0));
         }
+
+        @Test
+        @DisplayName("large input tumbling performance")
+        void largeInputPerformance() {
+            assertTimeoutPreemptively(Duration.ofSeconds(5), () ->
+                    IntStream.range(0, 100_000).boxed()
+                            .gather(tumblingWindow(1000))
+                            .skip(99)
+                            .limit(1)
+                            .toList()
+            );
+        }
     }
 
     // ═══════════════════════════════════════════════
@@ -169,6 +181,15 @@ class WindowGatherersTest {
                             .toList()
             );
         }
+
+        @Test
+        @DisplayName("stream shorter than window size emits nothing")
+        void shorterThanSize() {
+            List<Window<Integer>> result = Stream.of(1, 2)
+                    .gather(slidingWindow(3))
+                    .toList();
+            assertEquals(List.of(), result);
+        }
     }
 
     // ═══════════════════════════════════════════════
@@ -228,11 +249,11 @@ class WindowGatherersTest {
         @Test
         @DisplayName("single element")
         void singleElement() {
-            List<Window<TimedEvent>> result = Stream.of(new TimedEvent(1, "a"))
-                    .gather(sessionWindow(5, TimedEvent::ts))
+            List<Window<TimedEvent>> result = Stream.of(new TimedEvent(1, "only"))
+                    .gather(sessionWindow(10, TimedEvent::ts))
                     .toList();
             assertEquals(1, result.size());
-            assertEquals(1, result.get(0).size());
+            assertEquals(List.of(new TimedEvent(1, "only")), result.get(0).elements());
         }
 
         @Test
@@ -299,6 +320,16 @@ class WindowGatherersTest {
                     .gather(windowReduce((a, b) -> a * b))
                     .toList();
             assertEquals(List.of(2, 12), result);
+        }
+
+        @Test
+        @DisplayName("empty window emits nothing")
+        void emptyWindowEmitsNothing() {
+            Window<Integer> emptyWindow = new Window<>(0, 0, 0, List.of());
+            List<Integer> result = Stream.of(emptyWindow)
+                    .gather(windowReduce(Integer::sum))
+                    .toList();
+            assertEquals(List.of(), result);
         }
     }
 
@@ -372,6 +403,17 @@ class WindowGatherersTest {
                     .toList();
             assertEquals(List.of(1, 2, 3, 4), result);
         }
+
+        @Test
+        @DisplayName("short-circuits when downstream refuses further elements")
+        void shortCircuitsOnDownstreamRefusal() {
+            Window<Integer> window = new Window<>(0, 0, 2, List.of(1, 2, 3));
+            List<Integer> result = Stream.of(window)
+                    .gather(windowProcess(Window::elements))
+                    .limit(1)
+                    .toList();
+            assertEquals(List.of(1), result);
+        }
     }
 
     // ═══════════════════════════════════════════════
@@ -440,6 +482,13 @@ class WindowGatherersTest {
                     .toList();
             assertTrue(result.isEmpty());
         }
+
+        @Test
+        @DisplayName("invalid size throws")
+        void invalidSize() {
+            assertThrows(IllegalArgumentException.class,
+                    () -> keyedTumblingWindow(Event::key, 0));
+        }
     }
 
     // ═══════════════════════════════════════════════
@@ -465,6 +514,17 @@ class WindowGatherersTest {
             // A: [1,2] → A:3, [3] → A:3
             // B: [10,20] → B:30, [30] → B:30
             assertEquals(4, result.size());
+        }
+
+        @Test
+        @DisplayName("empty keyed window emits nothing")
+        void emptyKeyedWindowEmitsNothing() {
+            KeyedResult<String, Window<Integer>> emptyKeyed =
+                    new KeyedResult<>("key", new Window<>(0, 0, 0, List.of()));
+            List<KeyedResult<String, Integer>> result = Stream.of(emptyKeyed)
+                    .gather(keyedWindowReduce(Integer::sum))
+                    .toList();
+            assertEquals(List.of(), result);
         }
     }
 
@@ -625,6 +685,20 @@ class WindowGatherersTest {
                     tagged.stream().gather(coMap(i -> i, i -> i)).toList()
             );
         }
+
+        @Test
+        @DisplayName("connect short-circuits when downstream refuses further elements")
+        void shortCircuitsOnDownstreamRefusal() {
+            List<Tagged<String>> result = Stream.of("a", "b", "c")
+                    .gather(connect(List.of("x", "y")))
+                    .limit(3)
+                    .toList();
+            assertEquals(List.of(
+                    new Tagged<>("main", "a"),
+                    new Tagged<>("other", "x"),
+                    new Tagged<>("main", "b")
+            ), result);
+        }
     }
 
     // ═══════════════════════════════════════════════
@@ -743,6 +817,41 @@ class WindowGatherersTest {
             assertEquals(150, result.get(3).startIndex());
             assertEquals(249, result.get(3).endIndex());
             assertEquals(List.of(new TimedEvent(160, "d")), result.get(3).elements());
+        }
+
+        @Test
+        @DisplayName("overlapping windows when slide is smaller than size")
+        void overlappingWhenSlideSmallerThanSize() {
+            List<Window<TimedEvent>> result = Stream.of(
+                    new TimedEvent(100, "a"),
+                    new TimedEvent(150, "b"),
+                    new TimedEvent(200, "c")
+            ).gather(slidingTimeWindow(200, 50, TimedEvent::ts))
+                    .toList();
+
+            assertEquals(3, result.size());
+            assertEquals(List.of(
+                    new TimedEvent(100, "a"), new TimedEvent(150, "b"), new TimedEvent(200, "c")
+            ), result.get(0).elements());
+            assertEquals(List.of(
+                    new TimedEvent(150, "b"), new TimedEvent(200, "c")
+            ), result.get(1).elements());
+            assertEquals(List.of(new TimedEvent(200, "c")), result.get(2).elements());
+        }
+
+        @Test
+        @DisplayName("filters out empty windows")
+        void filtersEmptyWindows() {
+            List<Window<TimedEvent>> result = Stream.of(
+                    new TimedEvent(75, "a"),
+                    new TimedEvent(225, "b")
+            ).gather(slidingTimeWindow(100, 50, TimedEvent::ts))
+                    .toList();
+
+            assertEquals(3, result.size());
+            assertEquals(List.of(new TimedEvent(75, "a")), result.get(0).elements());
+            assertEquals(List.of(new TimedEvent(225, "b")), result.get(1).elements());
+            assertEquals(List.of(new TimedEvent(225, "b")), result.get(2).elements());
         }
     }
 
@@ -877,6 +986,26 @@ class WindowGatherersTest {
                     .toList();
             assertEquals(List.of(Optional.empty()), result);
         }
+
+        @Test
+        @DisplayName("min on an empty window returns empty Optional")
+        void minOnEmptyWindow() {
+            Window<Integer> emptyWindow = new Window<>(0, 0, 0, List.of());
+            List<Optional<Integer>> result = Stream.of(emptyWindow)
+                    .gather(windowMin(Comparator.naturalOrder()))
+                    .toList();
+            assertEquals(List.of(Optional.empty()), result);
+        }
+
+        @Test
+        @DisplayName("max on an empty window returns empty Optional")
+        void maxOnEmptyWindow() {
+            Window<Integer> emptyWindow = new Window<>(0, 0, 0, List.of());
+            List<Optional<Integer>> result = Stream.of(emptyWindow)
+                    .gather(windowMax(Comparator.naturalOrder()))
+                    .toList();
+            assertEquals(List.of(Optional.empty()), result);
+        }
     }
 
     // ═══════════════════════════════════════════════
@@ -960,156 +1089,6 @@ class WindowGatherersTest {
                     .gather(selectTag("text"))
                     .toList();
             assertEquals(List.of("STR:a", "STR:b"), result);
-        }
-    }
-
-    // ═══════════════════════════════════════════════
-    //  Missing branch coverage tests
-    // ═══════════════════════════════════════════════
-
-    @Nested
-    @DisplayName("Missing branch coverage")
-    class MissingBranchCoverageTest {
-
-        @Test
-        @DisplayName("windowReduce with empty window skips it")
-        void windowReduceEmptyWindow() {
-            // Create an empty Window manually and feed it through windowReduce
-            Window<Integer> emptyWindow = new Window<>(0, 0, 0, List.of());
-            List<Integer> result = Stream.of(emptyWindow)
-                    .gather(windowReduce(Integer::sum))
-                    .toList();
-            assertTrue(result.isEmpty());
-        }
-
-        @Test
-        @DisplayName("windowMin with empty window returns empty")
-        void windowMinEmptyWindow() {
-            Window<Integer> emptyWindow = new Window<>(0, 0, 0, List.of());
-            List<Optional<Integer>> result = Stream.of(emptyWindow)
-                    .gather(windowMin(Comparator.naturalOrder()))
-                    .toList();
-            assertEquals(List.of(Optional.empty()), result);
-        }
-
-        @Test
-        @DisplayName("windowMax with empty window returns empty")
-        void windowMaxEmptyWindow() {
-            Window<Integer> emptyWindow = new Window<>(0, 0, 0, List.of());
-            List<Optional<Integer>> result = Stream.of(emptyWindow)
-                    .gather(windowMax(Comparator.naturalOrder()))
-                    .toList();
-            assertEquals(List.of(Optional.empty()), result);
-        }
-
-        @Test
-        @DisplayName("windowProcess with short-circuit (downstream.push returns false)")
-        void windowProcessShortCircuit() {
-            // windowProcess's for-loop checks downstream.push return
-            Window<Integer> window = new Window<>(0, 0, 2, List.of(1, 2, 3));
-            List<Integer> result = Stream.of(window)
-                    .gather(windowProcess(w -> w.elements()))
-                    .limit(1)
-                    .toList();
-            assertEquals(List.of(1), result);
-        }
-
-        @Test
-        @DisplayName("keyedWindowReduce with empty window skips it")
-        void keyedWindowReduceEmptyWindow() {
-            KeyedResult<String, Window<Integer>> emptyKeyed =
-                    new KeyedResult<>("key", new Window<>(0, 0, 0, List.of()));
-            List<KeyedResult<String, Integer>> result = Stream.of(emptyKeyed)
-                    .gather(keyedWindowReduce(Integer::sum))
-                    .toList();
-            assertTrue(result.isEmpty());
-        }
-
-        @Test
-        @DisplayName("keyedTumblingWindow throws for size < 1")
-        void keyedTumblingWindowInvalidSize() {
-            assertThrows(IllegalArgumentException.class,
-                    () -> keyedTumblingWindow(Event::key, 0));
-        }
-
-        @Test
-        @DisplayName("slidingTimeWindow with startOffset going back (slide < size)")
-        void slidingTimeWindowStartOffsetBack() {
-            // When slide < size, the startOffset while-loop goes back
-            // e.g. size=200, slide=50 → windows overlap significantly
-            List<Window<TimedEvent>> result = Stream.of(
-                    new TimedEvent(100, "a"),
-                    new TimedEvent(150, "b"),
-                    new TimedEvent(200, "c")
-            ).gather(slidingTimeWindow(200, 50, TimedEvent::ts))
-                    .toList();
-            // At least one window should be produced
-            assertFalse(result.isEmpty());
-            // All windows should have elements
-            for (Window<TimedEvent> w : result) {
-                assertFalse(w.isEmpty());
-            }
-        }
-
-        @Test
-        @DisplayName("slidingTimeWindow with some empty windows filtered out")
-        void slidingTimeWindowEmptyWindows() {
-            // slide=50, size=100: overlapping windows
-            // Elements at ts=75, 225 → windows at [0-99](has 75), [50-149](has 75), [100-199](empty), [200-299](has 225), [250-349](has 225)
-            List<Window<TimedEvent>> result = Stream.of(
-                    new TimedEvent(75, "a"),
-                    new TimedEvent(225, "b")
-            ).gather(slidingTimeWindow(100, 50, TimedEvent::ts))
-                    .toList();
-            // The [100-199] window is empty and should be filtered out
-            assertFalse(result.isEmpty());
-            // All returned windows should be non-empty
-            for (Window<TimedEvent> w : result) {
-                assertFalse(w.isEmpty());
-            }
-        }
-
-        @Test
-        @DisplayName("slidingTimeWindow with empty stream")
-        void slidingTimeWindowEmpty() {
-            List<Window<TimedEvent>> result = Stream.<TimedEvent>empty()
-                    .gather(slidingTimeWindow(100, 50, TimedEvent::ts))
-                    .toList();
-            assertTrue(result.isEmpty());
-        }
-
-        @Test
-        @DisplayName("connect with limit short-circuits emitOther branch")
-        void connectShortCircuit() {
-            // When downstream short-circuits, the connect integrator's emitOther push may fail
-            List<Tagged<String>> result = Stream.of("a", "b", "c")
-                    .gather(connect(List.of("x", "y")))
-                    .limit(3)
-                    .toList();
-            assertEquals(3, result.size());
-            assertEquals(new Tagged<>("main", "a"), result.get(0));
-        }
-
-        @Test
-        @DisplayName("sessionWindow finisher emits buffered elements")
-        void sessionWindowFinisherBuffer() {
-            // Single element → no gap exceeded → finisher emits the buffer
-            List<Window<TimedEvent>> result = Stream.of(
-                    new TimedEvent(1, "only")
-            ).gather(sessionWindow(10, TimedEvent::ts))
-                    .toList();
-            assertEquals(1, result.size());
-            assertEquals(List.of(new TimedEvent(1, "only")), result.get(0).elements());
-        }
-
-        @Test
-        @DisplayName("slidingWindow with fewer elements than size produces no output")
-        void slidingWindowFewerThanSize() {
-            // When count < size, no full window is ever emitted, and the finisher is a no-op
-            List<Window<Integer>> result = Stream.of(1, 2)
-                    .gather(slidingWindow(3))
-                    .toList();
-            assertTrue(result.isEmpty());
         }
     }
 
@@ -1219,6 +1198,16 @@ class WindowGatherersTest {
         }
 
         @Test
+        @DisplayName("globalWindow stops after first emitted window")
+        void globalWindowLimit() {
+            List<Window<Integer>> result = Stream.iterate(0, i -> i + 1).limit(100)
+                    .gather(globalWindow())
+                    .limit(1)
+                    .toList();
+            assertEquals(1, result.size());
+        }
+
+        @Test
         @DisplayName("split and selectTag stop after limit")
         void splitSelectTagLimit() {
             List<Integer> result = Stream.iterate(0, i -> i + 1).limit(100)
@@ -1296,14 +1285,25 @@ class WindowGatherersTest {
         }
 
         @Test
-        @DisplayName("windowMin and windowMax stop after limit")
-        void windowMinMaxLimit() {
+        @DisplayName("windowMin stops after limit")
+        void windowMinLimit() {
             List<Optional<Integer>> minResult = Stream.of(5, 2, 8, 1, 9, 3)
                     .gather(tumblingWindow(3))
                     .gather(windowMin(Comparator.naturalOrder()))
                     .limit(1)
                     .toList();
             assertEquals(List.of(Optional.of(2)), minResult);
+        }
+
+        @Test
+        @DisplayName("windowMax stops after limit")
+        void windowMaxLimit() {
+            List<Optional<Integer>> maxResult = Stream.of(5, 2, 8, 1, 9, 3)
+                    .gather(tumblingWindow(3))
+                    .gather(windowMax(Comparator.naturalOrder()))
+                    .limit(1)
+                    .toList();
+            assertEquals(List.of(Optional.of(8)), maxResult);
         }
     }
 
@@ -1402,6 +1402,33 @@ class WindowGatherersTest {
         void coMapNull() {
             assertThrows(NullPointerException.class, () -> coMap(null, i -> i));
             assertThrows(NullPointerException.class, () -> coMap(i -> i, null));
+        }
+
+        @Test
+        @DisplayName("keyedTumblingWindow rejects null key extractor")
+        void keyedTumblingWindowNull() {
+            assertThrows(NullPointerException.class,
+                    () -> keyedTumblingWindow((java.util.function.Function<Event, String>) null, 2));
+        }
+
+        @Test
+        @DisplayName("keyedWindowReduce rejects null reducer")
+        void keyedWindowReduceNull() {
+            assertThrows(NullPointerException.class,
+                    () -> keyedWindowReduce((java.util.function.BinaryOperator<Integer>) null));
+        }
+
+        @Test
+        @DisplayName("keyedWindowAggregate rejects null functions")
+        void keyedWindowAggregateNull() {
+            assertThrows(NullPointerException.class,
+                    () -> keyedWindowAggregate((java.util.function.Supplier<Integer>) null, (a, b) -> a, a -> a));
+            assertThrows(NullPointerException.class,
+                    () -> keyedWindowAggregate(() -> 0,
+                            (java.util.function.BiFunction<Integer, Integer, Integer>) null, a -> a));
+            assertThrows(NullPointerException.class,
+                    () -> keyedWindowAggregate(() -> 0, (a, b) -> a,
+                            (java.util.function.Function<Integer, Integer>) null));
         }
     }
 }

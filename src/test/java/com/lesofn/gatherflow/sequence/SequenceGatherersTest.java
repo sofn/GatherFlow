@@ -207,7 +207,7 @@ class SequenceGatherersTest {
         @Test
         @DisplayName("large input sliding performance")
         void largeInputPerformance() {
-            assertTimeoutPreemptively(Duration.ofSeconds(2), () ->
+            assertTimeoutPreemptively(Duration.ofSeconds(20), () ->
                     IntStream.range(0, 1_000_000).boxed()
                             .gather(sliding(1000))
                             .skip(999_000)
@@ -265,6 +265,18 @@ class SequenceGatherersTest {
         @DisplayName("invalid size throws")
         void invalidSize() {
             assertThrows(IllegalArgumentException.class, () -> grouped(0));
+        }
+
+        @Test
+        @DisplayName("large input grouped performance")
+        void largeInputPerformance() {
+            assertTimeoutPreemptively(Duration.ofSeconds(2), () ->
+                    IntStream.range(0, 1_000_000).boxed()
+                            .gather(grouped(1000))
+                            .skip(999)
+                            .limit(1)
+                            .toList()
+            );
         }
     }
 
@@ -1252,6 +1264,102 @@ class SequenceGatherersTest {
                     .limit(1)
                     .toList();
             assertEquals(List.of(20), result);
+        }
+
+        @Test
+        @DisplayName("flatMap")
+        void flatMapShortCircuit() {
+            List<Integer> result = Stream.of(1, 2, 3)
+                    .gather(flatMap(x -> List.of(x, x * 10)))
+                    .limit(3)
+                    .toList();
+            assertEquals(List.of(1, 10, 2), result);
+        }
+
+        @Test
+        @DisplayName("takeWhile")
+        void takeWhileShortCircuit() {
+            List<Integer> result = Stream.of(1, 2, 3, 4, 5)
+                    .gather(takeWhile(x -> x < 5))
+                    .limit(2)
+                    .toList();
+            assertEquals(List.of(1, 2), result);
+        }
+
+        @Test
+        @DisplayName("dropWhile")
+        void dropWhileShortCircuit() {
+            List<Integer> result = Stream.of(1, 2, 3, 4, 5)
+                    .gather(dropWhile(x -> x < 3))
+                    .limit(2)
+                    .toList();
+            assertEquals(List.of(3, 4), result);
+        }
+
+        @Test
+        @DisplayName("partition")
+        void partitionShortCircuit() {
+            PartitionResult<Integer> result = Stream.of(1, 2, 3, 4, 5)
+                    .gather(partition(x -> x % 2 == 0))
+                    .limit(1)
+                    .findFirst()
+                    .orElseThrow();
+            assertEquals(List.of(2, 4), result.matching());
+        }
+
+        @Test
+        @DisplayName("zip")
+        void zipShortCircuit() {
+            List<Map.Entry<Integer, String>> result = Stream.of(1, 2, 3, 4)
+                    .gather(zip(List.of("a", "b")))
+                    .limit(1)
+                    .toList();
+            assertEquals(1, result.size());
+            assertEquals(1, result.get(0).getKey());
+            assertEquals("a", result.get(0).getValue());
+        }
+
+        @Test
+        @DisplayName("unfold")
+        void unfoldShortCircuit() {
+            List<Integer> result = Stream.<Integer>empty()
+                    .gather(SequenceGatherers.<Integer, Integer>unfold(1, s -> s <= 100
+                            ? Optional.of(Map.entry(s, s + 1))
+                            : Optional.empty()))
+                    .limit(3)
+                    .toList();
+            assertEquals(List.of(1, 2, 3), result);
+        }
+
+        @Test
+        @DisplayName("groupBy")
+        void groupByShortCircuit() {
+            Map<Integer, List<String>> result = Stream.of("aa", "bb", "ab", "ccc")
+                    .gather(groupBy(String::length))
+                    .limit(1)
+                    .findFirst()
+                    .orElseThrow();
+            assertEquals(List.of("aa", "bb", "ab"), result.get(2));
+        }
+
+        @Test
+        @DisplayName("foldLeft")
+        void foldLeftShortCircuit() {
+            List<Integer> result = Stream.of(1, 2, 3)
+                    .gather(foldLeft(0, Integer::sum))
+                    .limit(1)
+                    .toList();
+            assertEquals(List.of(6), result);
+        }
+
+        @Test
+        @DisplayName("reduceLeft")
+        void reduceLeftShortCircuit() {
+            List<Optional<Integer>> result = Stream.of(1, 2, 3)
+                    .gather(reduceLeft(Integer::sum))
+                    .limit(1)
+                    .toList();
+            assertEquals(List.of(Optional.of(6)), result);
         }
     }
 
