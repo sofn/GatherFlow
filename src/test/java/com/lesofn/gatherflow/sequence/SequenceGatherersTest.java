@@ -5,7 +5,10 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.*;
+import java.util.function.*;
+import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
 import static com.lesofn.gatherflow.sequence.SequenceGatherers.*;
@@ -174,6 +177,43 @@ class SequenceGatherersTest {
         @DisplayName("invalid step throws")
         void invalidStep() {
             assertThrows(IllegalArgumentException.class, () -> sliding(2, 0));
+        }
+
+        @Test
+        @DisplayName("step 2 with trailing partial window")
+        void stepTwoTrailingPartial() {
+            List<List<Integer>> result = Stream.of(1, 2, 3, 4)
+                    .gather(sliding(3, 2))
+                    .toList();
+            assertEquals(List.of(
+                    List.of(1, 2, 3),
+                    List.of(3, 4)
+            ), result);
+        }
+
+        @Test
+        @DisplayName("step 2 trailing partial after multiple full windows")
+        void stepTwoTrailingPartialAfterFullWindows() {
+            List<List<Integer>> result = Stream.of(1, 2, 3, 4, 5, 6)
+                    .gather(sliding(3, 2))
+                    .toList();
+            assertEquals(List.of(
+                    List.of(1, 2, 3),
+                    List.of(3, 4, 5),
+                    List.of(5, 6)
+            ), result);
+        }
+
+        @Test
+        @DisplayName("large input sliding performance")
+        void largeInputPerformance() {
+            assertTimeoutPreemptively(Duration.ofSeconds(2), () ->
+                    IntStream.range(0, 1_000_000).boxed()
+                            .gather(sliding(1000))
+                            .skip(999_000)
+                            .limit(1)
+                            .toList()
+            );
         }
     }
 
@@ -813,6 +853,15 @@ class SequenceGatherersTest {
                     .findFirst().orElseThrow();
             assertEquals(Optional.of(42), result);
         }
+
+        @Test
+        @DisplayName("null reduced result produces empty optional")
+        void nullResult() {
+            Optional<Integer> result = Stream.of(1, 2)
+                    .gather(reduceLeft((a, b) -> null))
+                    .findFirst().orElseThrow();
+            assertTrue(result.isEmpty());
+        }
     }
 
     // ═══════════════════════════════════════════
@@ -891,6 +940,15 @@ class SequenceGatherersTest {
         void emptyRange() {
             List<Integer> result = Stream.of(1, 2, 3)
                     .gather(slice(2, 2))
+                    .toList();
+            assertTrue(result.isEmpty());
+        }
+
+        @Test
+        @DisplayName("empty stream")
+        void emptyStream() {
+            List<Integer> result = Stream.<Integer>empty()
+                    .gather(slice(0, 3))
                     .toList();
             assertTrue(result.isEmpty());
         }
@@ -1032,6 +1090,282 @@ class SequenceGatherersTest {
                     .gather(groupBy(String::length))
                     .findFirst().orElseThrow();
             assertTrue(result.isEmpty());
+        }
+
+        @Test
+        @DisplayName("result map is immutable")
+        void immutableResult() {
+            Map<Integer, List<String>> result = Stream.of("aa", "bb", "ccc")
+                    .gather(groupBy(String::length))
+                    .findFirst().orElseThrow();
+            assertThrows(UnsupportedOperationException.class, () -> result.put(1, List.of()));
+        }
+    }
+
+    // ═══════════════════════════════════════════
+    //  Short-circuiting with limit
+    // ═══════════════════════════════════════════
+
+    @Nested
+    @DisplayName("short-circuiting with limit")
+    class ShortCircuitingTest {
+
+        @Test
+        @DisplayName("scanLeft")
+        void scanLeftShortCircuit() {
+            List<Integer> result = Stream.of(1, 2, 3, 4, 5)
+                    .gather(scanLeft(0, Integer::sum))
+                    .limit(3)
+                    .toList();
+            assertEquals(List.of(0, 1, 3), result);
+        }
+
+        @Test
+        @DisplayName("scanRight")
+        void scanRightShortCircuit() {
+            List<Integer> result = Stream.of(1, 2, 3, 4, 5)
+                    .gather(scanRight(0, Integer::sum))
+                    .limit(3)
+                    .toList();
+            assertEquals(List.of(15, 14, 12), result);
+        }
+
+        @Test
+        @DisplayName("sliding")
+        void slidingShortCircuit() {
+            List<List<Integer>> result = Stream.of(1, 2, 3, 4, 5)
+                    .gather(sliding(2))
+                    .limit(3)
+                    .toList();
+            assertEquals(List.of(List.of(1, 2), List.of(2, 3), List.of(3, 4)), result);
+        }
+
+        @Test
+        @DisplayName("grouped")
+        void groupedShortCircuit() {
+            List<List<Integer>> result = Stream.of(1, 2, 3, 4, 5)
+                    .gather(grouped(2))
+                    .limit(2)
+                    .toList();
+            assertEquals(List.of(List.of(1, 2), List.of(3, 4)), result);
+        }
+
+        @Test
+        @DisplayName("zipWithIndex")
+        void zipWithIndexShortCircuit() {
+            List<Map.Entry<String, Long>> result = Stream.of("a", "b", "c", "d")
+                    .gather(zipWithIndex())
+                    .limit(2)
+                    .toList();
+            assertEquals(2, result.size());
+            assertEquals("a", result.get(0).getKey());
+            assertEquals(0L, result.get(0).getValue());
+            assertEquals("b", result.get(1).getKey());
+            assertEquals(1L, result.get(1).getValue());
+        }
+
+        @Test
+        @DisplayName("slice")
+        void sliceShortCircuit() {
+            List<Integer> result = Stream.of(1, 2, 3, 4, 5, 6)
+                    .gather(slice(1, 5))
+                    .limit(2)
+                    .toList();
+            assertEquals(List.of(2, 3), result);
+        }
+
+        @Test
+        @DisplayName("interleave")
+        void interleaveShortCircuit() {
+            List<Integer> result = Stream.of(1, 3, 5, 7)
+                    .gather(interleave(List.of(2, 4, 6)))
+                    .limit(5)
+                    .toList();
+            assertEquals(List.of(1, 2, 3, 4, 5), result);
+        }
+
+        @Test
+        @DisplayName("reverse")
+        void reverseShortCircuit() {
+            List<Integer> result = Stream.of(1, 2, 3, 4, 5)
+                    .gather(reverse())
+                    .limit(2)
+                    .toList();
+            assertEquals(List.of(5, 4), result);
+        }
+
+        @Test
+        @DisplayName("cycle")
+        void cycleShortCircuit() {
+            List<Integer> result = Stream.of(1, 2, 3)
+                    .gather(cycle(10))
+                    .limit(4)
+                    .toList();
+            assertEquals(List.of(1, 2, 3, 1), result);
+        }
+
+        @Test
+        @DisplayName("intersperse")
+        void intersperseShortCircuit() {
+            List<Integer> result = Stream.of(1, 2, 3, 4)
+                    .gather(intersperse(0))
+                    .limit(3)
+                    .toList();
+            assertEquals(List.of(1, 0, 2), result);
+        }
+
+        @Test
+        @DisplayName("prepend")
+        void prependShortCircuit() {
+            List<Integer> result = Stream.of(2, 3)
+                    .gather(prepend(1))
+                    .limit(2)
+                    .toList();
+            assertEquals(List.of(1, 2), result);
+        }
+
+        @Test
+        @DisplayName("append")
+        void appendShortCircuit() {
+            List<Integer> result = Stream.of(1, 2)
+                    .gather(append(3))
+                    .limit(2)
+                    .toList();
+            assertEquals(List.of(1, 2), result);
+        }
+
+        @Test
+        @DisplayName("distinctBy")
+        void distinctByShortCircuit() {
+            List<Integer> result = Stream.of(1, 2, 3, 1, 2)
+                    .gather(distinctBy(i -> i))
+                    .limit(3)
+                    .toList();
+            assertEquals(List.of(1, 2, 3), result);
+        }
+
+        @Test
+        @DisplayName("collect")
+        void collectShortCircuit() {
+            List<Integer> result = Stream.of(1, 2, 3, 4)
+                    .gather(collect(x -> x % 2 == 0, x -> x * 10))
+                    .limit(1)
+                    .toList();
+            assertEquals(List.of(20), result);
+        }
+    }
+
+    // ═══════════════════════════════════════════
+    //  Null argument validation
+    // ═══════════════════════════════════════════
+
+    @Nested
+    @DisplayName("null argument validation")
+    class NullArgumentValidationTest {
+
+        @Test
+        @DisplayName("scanLeft")
+        void scanLeftNullOperator() {
+            assertThrows(NullPointerException.class,
+                    () -> scanLeft(0, (BiFunction<Integer, Integer, Integer>) null));
+        }
+
+        @Test
+        @DisplayName("scanRight")
+        void scanRightNullOperator() {
+            assertThrows(NullPointerException.class,
+                    () -> scanRight(0, (BiFunction<Integer, Integer, Integer>) null));
+        }
+
+        @Test
+        @DisplayName("distinctBy")
+        void distinctByNullExtractor() {
+            assertThrows(NullPointerException.class,
+                    () -> distinctBy((Function<String, Integer>) null));
+        }
+
+        @Test
+        @DisplayName("takeWhile")
+        void takeWhileNullPredicate() {
+            assertThrows(NullPointerException.class,
+                    () -> takeWhile((Predicate<Integer>) null));
+        }
+
+        @Test
+        @DisplayName("dropWhile")
+        void dropWhileNullPredicate() {
+            assertThrows(NullPointerException.class,
+                    () -> dropWhile((Predicate<Integer>) null));
+        }
+
+        @Test
+        @DisplayName("partition")
+        void partitionNullPredicate() {
+            assertThrows(NullPointerException.class,
+                    () -> partition((Predicate<Integer>) null));
+        }
+
+        @Test
+        @DisplayName("flatMap")
+        void flatMapNullMapper() {
+            assertThrows(NullPointerException.class,
+                    () -> flatMap((Function<Integer, Iterable<Integer>>) null));
+        }
+
+        @Test
+        @DisplayName("collect")
+        void collectNullArgs() {
+            assertThrows(NullPointerException.class,
+                    () -> collect((Predicate<Integer>) null, (Function<Integer, Integer>) null));
+        }
+
+        @Test
+        @DisplayName("peek")
+        void peekNullAction() {
+            assertThrows(NullPointerException.class,
+                    () -> peek((Consumer<Integer>) null));
+        }
+
+        @Test
+        @DisplayName("interleave")
+        void interleaveNullIterable() {
+            assertThrows(NullPointerException.class,
+                    () -> interleave((Iterable<Integer>) null));
+        }
+
+        @Test
+        @DisplayName("foldLeft")
+        void foldLeftNullOperator() {
+            assertThrows(NullPointerException.class,
+                    () -> foldLeft(0, (BiFunction<Integer, Integer, Integer>) null));
+        }
+
+        @Test
+        @DisplayName("reduceLeft")
+        void reduceLeftNullOperator() {
+            assertThrows(NullPointerException.class,
+                    () -> reduceLeft((BinaryOperator<Integer>) null));
+        }
+
+        @Test
+        @DisplayName("zip")
+        void zipNullIterable() {
+            assertThrows(NullPointerException.class,
+                    () -> zip((Iterable<String>) null));
+        }
+
+        @Test
+        @DisplayName("unfold")
+        void unfoldNullFunction() {
+            assertThrows(NullPointerException.class,
+                    () -> unfold(1, (Function<Integer, Optional<Map.Entry<Integer, Integer>>>) null));
+        }
+
+        @Test
+        @DisplayName("groupBy")
+        void groupByNullExtractor() {
+            assertThrows(NullPointerException.class,
+                    () -> groupBy((Function<String, Integer>) null));
         }
     }
 

@@ -3,7 +3,6 @@ package com.lesofn.gatherflow.sequence;
 import java.util.*;
 import java.util.function.*;
 import java.util.stream.Gatherer;
-import java.util.stream.Gatherers;
 import java.util.stream.Stream;
 
 /**
@@ -60,7 +59,7 @@ public final class SequenceGatherers {
                 () -> new Object() { A acc = zero; boolean emittedInitial = false; },
                 (state, element, downstream) -> {
                     if (!state.emittedInitial) {
-                        downstream.push(state.acc);
+                        if (!downstream.push(state.acc)) return false;
                         state.emittedInitial = true;
                     }
                     state.acc = op.apply(state.acc, element);
@@ -68,7 +67,7 @@ public final class SequenceGatherers {
                 },
                 (state, downstream) -> {
                     if (!state.emittedInitial) {
-                        downstream.push(state.acc);
+                        if (!downstream.push(state.acc)) return;
                     }
                 }
         );
@@ -104,7 +103,7 @@ public final class SequenceGatherers {
                     }
                     Collections.reverse(results);
                     for (A r : results) {
-                        downstream.push(r);
+                        if (!downstream.push(r)) return;
                     }
                 }
         );
@@ -142,24 +141,36 @@ public final class SequenceGatherers {
         if (step < 1) throw new IllegalArgumentException("step must be >= 1, got " + step);
         return Gatherer.ofSequential(
                 () -> new Object() {
-                    final List<T> window = new ArrayList<>();
+                    final ArrayDeque<T> window = new ArrayDeque<>();
                     int count = 0;
                 },
                 (state, element, downstream) -> {
-                    state.window.add(element);
+                    state.window.addLast(element);
                     state.count++;
                     if (state.window.size() > size) {
-                        state.window.removeFirst();
+                        state.window.pollFirst();
                     }
                     if (state.count >= size && (state.count - size) % step == 0) {
-                        downstream.push(new ArrayList<>(state.window));
+                        return downstream.push(new ArrayList<>(state.window));
                     }
                     return true;
                 },
                 (state, downstream) -> {
-                    // Emit remaining partial window if we started but didn't complete a full one
-                    if (!state.window.isEmpty() && state.count < size) {
-                        downstream.push(new ArrayList<>(state.window));
+                    if (state.count < size) {
+                        // Stream ended before a full window was ready.
+                        if (!state.window.isEmpty()) {
+                            if (!downstream.push(new ArrayList<>(state.window))) return;
+                        }
+                    } else if ((state.count - size) % step != 0) {
+                        // Trailing partial window after the last aligned full window.
+                        int lastFullStart = ((state.count - size) / step) * step;
+                        int nextStart = lastFullStart + step;
+                        int partialSize = state.count - nextStart;
+                        if (partialSize > 0) {
+                            List<T> current = new ArrayList<>(state.window);
+                            if (!downstream.push(new ArrayList<>(
+                                    current.subList(current.size() - partialSize, current.size())))) return;
+                        }
                     }
                 }
         );
@@ -181,14 +192,14 @@ public final class SequenceGatherers {
                 (state, element, downstream) -> {
                     state.chunk.add(element);
                     if (state.chunk.size() == size) {
-                        downstream.push(new ArrayList<>(state.chunk));
+                        if (!downstream.push(new ArrayList<>(state.chunk))) return false;
                         state.chunk.clear();
                     }
                     return true;
                 },
                 (state, downstream) -> {
                     if (!state.chunk.isEmpty()) {
-                        downstream.push(new ArrayList<>(state.chunk));
+                        if (!downstream.push(new ArrayList<>(state.chunk))) return;
                     }
                 }
         );
@@ -212,7 +223,7 @@ public final class SequenceGatherers {
                 () -> new Object() { boolean first = true; },
                 (state, element, downstream) -> {
                     if (!state.first) {
-                        downstream.push(separator);
+                        if (!downstream.push(separator)) return false;
                     }
                     state.first = false;
                     return downstream.push(element);
@@ -236,9 +247,8 @@ public final class SequenceGatherers {
         return Gatherer.ofSequential(
                 () -> new Object() { long index = 0; },
                 (state, element, downstream) -> {
-                    downstream.push(new AbstractMap.SimpleImmutableEntry<>(element, state.index));
-                    state.index++;
-                    return true;
+                    long idx = state.index++;
+                    return downstream.push(new AbstractMap.SimpleImmutableEntry<>(element, idx));
                 }
         );
     }
@@ -448,7 +458,7 @@ public final class SequenceGatherers {
                 () -> new Object() { boolean emitted = false; },
                 (state, t, downstream) -> {
                     if (!state.emitted) {
-                        downstream.push(element);
+                        if (!downstream.push(element)) return false;
                         state.emitted = true;
                     }
                     return downstream.push(t);
@@ -456,7 +466,7 @@ public final class SequenceGatherers {
                 (state, downstream) -> {
                     // If stream was empty, still emit the prepended element
                     if (!state.emitted) {
-                        downstream.push(element);
+                        if (!downstream.push(element)) return;
                     }
                 }
         );
@@ -504,7 +514,7 @@ public final class SequenceGatherers {
                     while (emitted < times) {
                         for (T e : state.buffer) {
                             if (emitted >= times) return;
-                            downstream.push(e);
+                            if (!downstream.push(e)) return;
                             emitted++;
                         }
                     }
@@ -533,15 +543,15 @@ public final class SequenceGatherers {
                     final Iterator<? extends T> otherIter = other.iterator();
                 },
                 (state, element, downstream) -> {
-                    downstream.push(element);
+                    if (!downstream.push(element)) return false;
                     if (state.otherIter.hasNext()) {
-                        downstream.push(state.otherIter.next());
+                        return downstream.push(state.otherIter.next());
                     }
                     return true;
                 },
                 (state, downstream) -> {
                     while (state.otherIter.hasNext()) {
-                        downstream.push(state.otherIter.next());
+                        if (!downstream.push(state.otherIter.next())) return;
                     }
                 }
         );
@@ -553,7 +563,7 @@ public final class SequenceGatherers {
 
     /**
      * Fold all elements into a single result, emitted once at the end.
-     * Unlike {@link Gatherers#fold}, this does NOT emit the initial value.
+     * Unlike {@link java.util.stream.Gatherers#fold}, this does NOT emit the initial value.
      *
      * <p>Scala: {@code list.foldLeft(z)(op)}</p>
      * <p>Example: {@code [1,2,3].foldLeft(0, +) → 6}</p>
@@ -605,7 +615,7 @@ public final class SequenceGatherers {
                     return true;
                 },
                 (state, downstream) -> downstream.push(
-                        state.hasValue ? Optional.of(state.acc) : Optional.empty()
+                        state.hasValue ? Optional.ofNullable(state.acc) : Optional.empty()
                 )
         );
     }
@@ -631,7 +641,7 @@ public final class SequenceGatherers {
                 },
                 (state, downstream) -> {
                     for (int i = state.buffer.size() - 1; i >= 0; i--) {
-                        downstream.push(state.buffer.get(i));
+                        if (!downstream.push(state.buffer.get(i))) return;
                     }
                 }
         );
@@ -659,7 +669,9 @@ public final class SequenceGatherers {
                 (state, element, downstream) -> {
                     if (state.index >= toIndex) return false; // short-circuit
                     if (state.index >= fromIndex) {
-                        downstream.push(element);
+                        boolean pushed = downstream.push(element);
+                        state.index++;
+                        return pushed;
                     }
                     state.index++;
                     return true;
@@ -686,8 +698,7 @@ public final class SequenceGatherers {
                 () -> new Object() { final Iterator<? extends U> otherIter = other.iterator(); },
                 (state, element, downstream) -> {
                     if (!state.otherIter.hasNext()) return false; // stop when other runs out
-                    downstream.push(new AbstractMap.SimpleImmutableEntry<>(element, state.otherIter.next()));
-                    return true;
+                    return downstream.push(new AbstractMap.SimpleImmutableEntry<>(element, state.otherIter.next()));
                 }
         );
     }
@@ -752,7 +763,7 @@ public final class SequenceGatherers {
                 (state, downstream) -> {
                     Map<K, List<T>> result = new LinkedHashMap<>();
                     state.map.forEach((k, v) -> result.put(k, List.copyOf(v)));
-                    downstream.push(result);
+                    downstream.push(Collections.unmodifiableMap(result));
                 }
         );
     }
