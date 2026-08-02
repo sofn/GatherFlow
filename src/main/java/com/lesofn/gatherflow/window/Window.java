@@ -1,5 +1,7 @@
 package com.lesofn.gatherflow.window;
 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 /**
@@ -19,7 +21,7 @@ public record Window<T>(
         List<T> elements
 ) {
     public Window {
-        elements = List.copyOf(elements);
+        elements = Collections.unmodifiableList(new ArrayList<>(elements));
     }
 
     /** Number of elements in this window. */

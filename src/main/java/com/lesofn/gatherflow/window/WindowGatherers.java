@@ -72,12 +72,12 @@ public final class WindowGatherers {
                 (state, element, downstream) -> {
                     state.buffer.add(element);
                     if (state.buffer.size() == size) {
-                        downstream.push(new Window<>(
+                        if (!downstream.push(new Window<>(
                                 state.windowId,
                                 state.windowStartIndex,
                                 state.globalIndex,
                                 state.buffer
-                        ));
+                        ))) return false;
                         state.buffer.clear();
                         state.windowId++;
                         state.windowStartIndex = state.globalIndex + 1;
@@ -87,12 +87,12 @@ public final class WindowGatherers {
                 },
                 (state, downstream) -> {
                     if (!state.buffer.isEmpty()) {
-                        downstream.push(new Window<>(
+                        if (!downstream.push(new Window<>(
                                 state.windowId,
                                 state.windowStartIndex,
                                 state.globalIndex - 1,
                                 state.buffer
-                        ));
+                        ))) return;
                     }
                 }
         );
@@ -132,35 +132,59 @@ public final class WindowGatherers {
         if (slide < 1) throw new IllegalArgumentException("slide must be >= 1, got " + slide);
         return Gatherer.ofSequential(
                 () -> new Object() {
-                    final List<T> buffer = new ArrayList<>();
+                    final ArrayDeque<T> buffer = new ArrayDeque<>();
+                    long bufferStartIndex = 0;
                     long globalIndex = 0;
                     long windowId = 0;
                     long nextWindowStart = 0;
                 },
                 (state, element, downstream) -> {
                     state.buffer.add(element);
-                    // Emit window when we have enough elements and are at a window boundary
-                    if (state.globalIndex >= size - 1
-                            && (state.globalIndex - (size - 1)) == state.nextWindowStart) {
-                        int from = state.buffer.size() - size;
-                        List<T> windowElements = new ArrayList<>(
-                                state.buffer.subList(Math.max(0, from), state.buffer.size())
-                        );
-                        downstream.push(new Window<>(
+                    while (state.nextWindowStart + size - 1 <= state.globalIndex) {
+                        int relStart = (int) (state.nextWindowStart - state.bufferStartIndex);
+                        List<T> windowElements = new ArrayList<>(size);
+                        int idx = 0;
+                        for (T e : state.buffer) {
+                            if (idx >= relStart + size) break;
+                            if (idx >= relStart) windowElements.add(e);
+                            idx++;
+                        }
+                        long endIndex = state.nextWindowStart + size - 1;
+                        if (!downstream.push(new Window<>(
                                 state.windowId,
                                 state.nextWindowStart,
-                                state.globalIndex,
+                                endIndex,
                                 windowElements
-                        ));
+                        ))) return false;
                         state.windowId++;
                         state.nextWindowStart += slide;
+                        while (!state.buffer.isEmpty() && state.bufferStartIndex < state.nextWindowStart) {
+                            state.buffer.pollFirst();
+                            state.bufferStartIndex++;
+                        }
                     }
                     state.globalIndex++;
                     return true;
                 },
                 (state, downstream) -> {
-                    // Emit any remaining partial window if we haven't started one yet
-                    // (Flink would not emit partial, but for bounded streams it's useful)
+                    if (slide > 1 && state.nextWindowStart < state.globalIndex) {
+                        int relStart = (int) (state.nextWindowStart - state.bufferStartIndex);
+                        if (relStart < state.buffer.size()) {
+                            List<T> windowElements = new ArrayList<>();
+                            int idx = 0;
+                            for (T e : state.buffer) {
+                                if (idx >= relStart) windowElements.add(e);
+                                idx++;
+                            }
+                            long endIndex = state.globalIndex - 1;
+                            if (!downstream.push(new Window<>(
+                                    state.windowId,
+                                    state.nextWindowStart,
+                                    endIndex,
+                                    windowElements
+                            ))) return;
+                        }
+                    }
                 }
         );
     }
@@ -198,12 +222,12 @@ public final class WindowGatherers {
                     long ts = timestampExtractor.applyAsLong(element);
                     if (!state.buffer.isEmpty() && (ts - state.lastTimestamp) > gap) {
                         // Gap exceeded — emit current session and start new one
-                        downstream.push(new Window<>(
+                        if (!downstream.push(new Window<>(
                                 state.windowId,
                                 state.windowStartIndex,
                                 state.globalIndex - 1,
                                 state.buffer
-                        ));
+                        ))) return false;
                         state.buffer.clear();
                         state.windowId++;
                         state.windowStartIndex = state.globalIndex;
@@ -215,12 +239,12 @@ public final class WindowGatherers {
                 },
                 (state, downstream) -> {
                     if (!state.buffer.isEmpty()) {
-                        downstream.push(new Window<>(
+                        if (!downstream.push(new Window<>(
                                 state.windowId,
                                 state.windowStartIndex,
                                 state.globalIndex - 1,
                                 state.buffer
-                        ));
+                        ))) return;
                     }
                 }
         );
@@ -252,7 +276,7 @@ public final class WindowGatherers {
                 },
                 (state, downstream) -> {
                     if (!state.buffer.isEmpty()) {
-                        downstream.push(new Window<>(0, 0, state.globalIndex - 1, state.buffer));
+                        if (!downstream.push(new Window<>(0, 0, state.globalIndex - 1, state.buffer))) return;
                     }
                 }
         );
@@ -411,8 +435,8 @@ public final class WindowGatherers {
 
                     List<T> buffer = state.keyedBuffers.get(key);
                     if (buffer.size() == size) {
-                        downstream.push(new KeyedResult<>(key, new Window<>(
-                                windowId, idx - size + 1, idx, buffer)));
+                        if (!downstream.push(new KeyedResult<>(key, new Window<>(
+                                windowId, idx - size + 1, idx, buffer)))) return false;
                         buffer.clear();
                         state.keyedWindowIds.put(key, windowId + 1);
                     }
@@ -421,14 +445,16 @@ public final class WindowGatherers {
                 },
                 (state, downstream) -> {
                     // Emit remaining partial windows per key
-                    state.keyedBuffers.forEach((key, buffer) -> {
+                    for (var entry : state.keyedBuffers.entrySet()) {
+                        K key = entry.getKey();
+                        List<T> buffer = entry.getValue();
                         if (!buffer.isEmpty()) {
                             long idx = state.keyedIndices.getOrDefault(key, 0L);
                             long windowId = state.keyedWindowIds.getOrDefault(key, 0L);
-                            downstream.push(new KeyedResult<>(key, new Window<>(
-                                    windowId, idx - buffer.size(), idx - 1, buffer)));
+                            if (!downstream.push(new KeyedResult<>(key, new Window<>(
+                                    windowId, idx - buffer.size(), idx - 1, buffer)))) return;
                         }
-                    });
+                    }
                 }
         );
     }
@@ -512,7 +538,7 @@ public final class WindowGatherers {
                 (_, element, downstream) -> downstream.push(element),
                 (_, downstream) -> {
                     for (T t : other) {
-                        downstream.push(t);
+                        if (!downstream.push(t)) return;
                     }
                 }
         );
@@ -536,8 +562,11 @@ public final class WindowGatherers {
     public static <T> Gatherer<T, ?, Tagged<T>> split(Function<? super T, String> classifier) {
         Objects.requireNonNull(classifier);
         return Gatherer.ofSequential(
-                (_, element, downstream) ->
-                        downstream.push(new Tagged<>(classifier.apply(element), element))
+                (_, element, downstream) -> {
+                    String tag = Objects.requireNonNull(classifier.apply(element),
+                            "split classifier returned null tag");
+                    return downstream.push(new Tagged<>(tag, element));
+                }
         );
     }
 
@@ -553,7 +582,7 @@ public final class WindowGatherers {
         Objects.requireNonNull(tag);
         return Gatherer.ofSequential(
                 (_, tagged, downstream) -> {
-                    if (tag.equals(tagged.tag())) {
+                    if (Objects.equals(tag, tagged.tag())) {
                         return downstream.push(tagged.value());
                     }
                     return true;
@@ -582,15 +611,15 @@ public final class WindowGatherers {
                     final Iterator<? extends T> otherIter = other.iterator();
                 },
                 (state, element, downstream) -> {
-                    downstream.push(new Tagged<>("main", element));
+                    if (!downstream.push(new Tagged<>("main", element))) return false;
                     if (state.otherIter.hasNext()) {
-                        downstream.push(new Tagged<>("other", state.otherIter.next()));
+                        if (!downstream.push(new Tagged<>("other", state.otherIter.next()))) return false;
                     }
                     return true;
                 },
                 (state, downstream) -> {
                     while (state.otherIter.hasNext()) {
-                        downstream.push(new Tagged<>("other", state.otherIter.next()));
+                        if (!downstream.push(new Tagged<>("other", state.otherIter.next()))) return;
                     }
                 }
         );
@@ -614,8 +643,10 @@ public final class WindowGatherers {
                 (_, tagged, downstream) -> {
                     if ("main".equals(tagged.tag())) {
                         return downstream.push(mainMapper.apply(tagged.value()));
-                    } else {
+                    } else if ("other".equals(tagged.tag())) {
                         return downstream.push(otherMapper.apply(tagged.value()));
+                    } else {
+                        throw new IllegalArgumentException("Unknown tag: " + tagged.tag());
                     }
                 }
         );
@@ -659,7 +690,7 @@ public final class WindowGatherers {
                         for (var entry : state.windows.entrySet()) {
                             long ws = entry.getKey();
                             long we = ws + size - 1;
-                            downstream.push(new Window<>(state.windowId, ws, we, entry.getValue()));
+                            if (!downstream.push(new Window<>(state.windowId, ws, we, entry.getValue()))) return false;
                             state.windowId++;
                         }
                         state.windows.clear();
@@ -672,7 +703,7 @@ public final class WindowGatherers {
                     for (var entry : state.windows.entrySet()) {
                         long ws = entry.getKey();
                         long we = ws + size - 1;
-                        downstream.push(new Window<>(state.windowId, ws, we, entry.getValue()));
+                        if (!downstream.push(new Window<>(state.windowId, ws, we, entry.getValue()))) return;
                         state.windowId++;
                     }
                 }
@@ -707,31 +738,42 @@ public final class WindowGatherers {
                     return true;
                 },
                 (state, downstream) -> {
-                    if (state.elements.isEmpty()) return;
-                    // Find min and max timestamps to determine window range
-                    long minTs = state.timestamps.stream().min(Long::compare).orElse(0L);
-                    long maxTs = state.timestamps.stream().max(Long::compare).orElse(0L);
-                    // Align first window start
-                    long firstWindowStart = (minTs / slide) * slide;
-                    // Slide may be less than size, so we need to go back
-                    long startOffset = firstWindowStart;
-                    while (startOffset + size > minTs) {
-                        startOffset -= slide;
+                    int n = state.elements.size();
+                    if (n == 0) return;
+                    long[] timestamps = new long[n];
+                    for (int i = 0; i < n; i++) {
+                        timestamps[i] = state.timestamps.get(i);
                     }
+                    Integer[] indices = new Integer[n];
+                    Arrays.setAll(indices, i -> i);
+                    Arrays.sort(indices, Comparator.comparingLong(i -> timestamps[i]));
+                    long minTs = timestamps[indices[0]];
+                    long maxTs = timestamps[indices[n - 1]];
+                    long firstStart = Math.floorDiv(minTs, slide) * slide;
+                    if (firstStart + size <= minTs) {
+                        firstStart += slide;
+                    }
+                    int left = 0;
+                    int right = 0;
                     long windowId = 0;
-                    for (long ws = startOffset; ws <= maxTs; ws += slide) {
-                        long we = ws + size - 1;
-                        List<T> windowElements = new ArrayList<>();
-                        for (int i = 0; i < state.elements.size(); i++) {
-                            long ts = state.timestamps.get(i);
-                            if (ts >= ws && ts <= we) {
-                                windowElements.add(state.elements.get(i));
-                            }
+                    for (long s = firstStart; s <= maxTs; s += slide) {
+                        long windowEnd = s + size - 1;
+                        while (left < n && timestamps[indices[left]] < s) {
+                            left++;
                         }
-                        if (!windowElements.isEmpty()) {
-                            downstream.push(new Window<>(windowId, ws, we, windowElements));
+                        if (left == n) break;
+                        while (right < n && timestamps[indices[right]] <= windowEnd) {
+                            right++;
+                        }
+                        if (left < right) {
+                            List<T> windowElements = new ArrayList<>(right - left);
+                            for (int i = left; i < right; i++) {
+                                windowElements.add(state.elements.get(indices[i]));
+                            }
+                            if (!downstream.push(new Window<>(windowId, s, windowEnd, windowElements))) break;
                             windowId++;
                         }
+                        if (s > Long.MAX_VALUE - slide) break;
                     }
                 }
         );
@@ -795,8 +837,7 @@ public final class WindowGatherers {
                     for (T e : window.elements()) {
                         sum += valueExtractor.applyAsDouble(e);
                     }
-                    downstream.push(sum);
-                    return true;
+                    return downstream.push(sum);
                 }
         );
     }
@@ -817,12 +858,17 @@ public final class WindowGatherers {
         Objects.requireNonNull(comparator);
         return Gatherer.ofSequential(
                 (_, window, downstream) -> {
-                    if (window.isEmpty()) {
-                        downstream.push(Optional.empty());
-                    } else {
-                        downstream.push(Optional.of(window.elements().stream().min(comparator).orElseThrow()));
+                    T min = null;
+                    boolean found = false;
+                    for (T e : window.elements()) {
+                        if (!found) {
+                            min = e;
+                            found = true;
+                        } else if (comparator.compare(e, min) < 0) {
+                            min = e;
+                        }
                     }
-                    return true;
+                    return downstream.push(Optional.ofNullable(min));
                 }
         );
     }
@@ -839,12 +885,17 @@ public final class WindowGatherers {
         Objects.requireNonNull(comparator);
         return Gatherer.ofSequential(
                 (_, window, downstream) -> {
-                    if (window.isEmpty()) {
-                        downstream.push(Optional.empty());
-                    } else {
-                        downstream.push(Optional.of(window.elements().stream().max(comparator).orElseThrow()));
+                    T max = null;
+                    boolean found = false;
+                    for (T e : window.elements()) {
+                        if (!found) {
+                            max = e;
+                            found = true;
+                        } else if (comparator.compare(e, max) > 0) {
+                            max = e;
+                        }
                     }
-                    return true;
+                    return downstream.push(Optional.ofNullable(max));
                 }
         );
     }
