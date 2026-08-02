@@ -41,26 +41,3 @@ jobs:
 
     - name: Build with Gradle Wrapper
       run: ./gradlew build
-
-  dependency-submission:
-
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    if: github.event_name == 'push'
-
-    steps:
-    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      with:
-        persist-credentials: false
-
-    - name: Set up JDK 25
-      uses: actions/setup-java@99b8673ff64fbf99d48d1e11e2c2b5ff3608851a # v4.7.0
-      with:
-        java-version: '25'
-        distribution: 'temurin'
-
-    # Generates and submits a dependency graph, enabling Dependabot Alerts for all project dependencies.
-    # See: https://github.com/gradle/actions/blob/main/dependency-submission/README.md
-    - name: Generate and submit dependency graph
-      uses: gradle/actions/dependency-submission@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
