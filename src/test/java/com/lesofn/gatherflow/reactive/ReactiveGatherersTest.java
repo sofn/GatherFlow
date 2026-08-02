@@ -7,6 +7,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.*;
 import java.util.concurrent.atomic.*;
+import java.util.function.*;
 import java.util.stream.Stream;
 
 import static com.lesofn.gatherflow.reactive.ReactiveGatherers.*;
@@ -340,15 +341,18 @@ class ReactiveGatherersTest {
     class DoOnErrorTest {
 
         @Test
-        @DisplayName("observes error and re-throws")
+        @DisplayName("observes error, invokes consumer, and re-throws")
         void observesError() {
             List<Throwable> errors = new ArrayList<>();
-            assertThrows(Exception.class, () -> {
+            RuntimeException ex = assertThrows(RuntimeException.class, () -> {
                 Stream.of(1, 2, 3)
                         .gather(doOnError(errors::add))
                         .map(x -> { if (x == 2) throw new RuntimeException("boom"); return x; })
                         .toList();
             });
+            assertEquals("boom", ex.getMessage());
+            assertEquals(1, errors.size());
+            assertEquals("boom", errors.get(0).getMessage());
         }
 
         @Test
@@ -533,26 +537,33 @@ class ReactiveGatherersTest {
                     .toList();
             // Element 1: attempt=1, success; Element 2: attempt=2 fail, attempt=3 success
             assertEquals(List.of("v1", "v2", "v3"), result);
+            assertEquals(4, attempt.get());
         }
 
         @Test
         @DisplayName("exhausted retries throws")
         void exhaustedRetries() {
+            AtomicInteger attempt = new AtomicInteger(0);
             assertThrows(RuntimeException.class, () -> {
                 Stream.of(1).gather(retry(i -> {
+                    attempt.incrementAndGet();
                     throw new RuntimeException("always fails");
                 }, 2)).toList();
             });
+            assertEquals(3, attempt.get());
         }
 
         @Test
         @DisplayName("zero retries means no retry")
         void zeroRetries() {
+            AtomicInteger attempt = new AtomicInteger(0);
             assertThrows(RuntimeException.class, () -> {
                 Stream.of(1).gather(retry(i -> {
+                    attempt.incrementAndGet();
                     throw new RuntimeException("fail");
                 }, 0)).toList();
             });
+            assertEquals(1, attempt.get());
         }
 
         @Test
@@ -1265,6 +1276,584 @@ class ReactiveGatherersTest {
                     .limit(1)
                     .toList();
             assertEquals(List.of("a"), result);
+        }
+    }
+
+    // ═══════════════════════════════════════════════
+    //  Additional behavior (null values, out-of-order timestamps, etc.)
+    // ═══════════════════════════════════════════════
+
+    @Nested
+    @DisplayName("Additional behavior")
+    class AdditionalBehaviorTest {
+
+        @Test
+        @DisplayName("debounce treats a single null as a real value")
+        void debounceSingleNull() {
+            List<String> result = Stream.<String>of((String) null)
+                    .gather(debounce(100, s -> 0L))
+                    .toList();
+            assertEquals(1, result.size());
+            assertNull(result.get(0));
+        }
+
+        @Test
+        @DisplayName("debounce emits null as a real value, not dropped")
+        void debounceNullInSequence() {
+            ToLongFunction<String> ts = s -> s == null ? 0L : (long) s.length();
+            List<String> result = Stream.of("a", null, "bb")
+                    .gather(debounce(0, ts))
+                    .toList();
+            assertEquals(2, result.size());
+            assertNull(result.get(0));
+            assertEquals("bb", result.get(1));
+        }
+
+        @Test
+        @DisplayName("skipLast handles null elements")
+        void skipLastNull() {
+            List<String> result = Stream.of("a", null, "b", "c")
+                    .gather(skipLast(1))
+                    .toList();
+            assertEquals(3, result.size());
+            assertEquals("a", result.get(0));
+            assertNull(result.get(1));
+            assertEquals("b", result.get(2));
+        }
+
+        @Test
+        @DisplayName("takeLast handles null elements")
+        void takeLastNull() {
+            List<String> result = Stream.of("a", null, "b")
+                    .gather(takeLast(2))
+                    .toList();
+            assertEquals(2, result.size());
+            assertNull(result.get(0));
+            assertEquals("b", result.get(1));
+        }
+
+        @Test
+        @DisplayName("first with null element returns Optional.empty")
+        void firstNull() {
+            Optional<String> result = Stream.<String>of(null, "b")
+                    .gather(first())
+                    .findFirst()
+                    .orElseThrow();
+            assertTrue(result.isEmpty());
+        }
+
+        @Test
+        @DisplayName("last with null element returns Optional.empty")
+        void lastNull() {
+            Optional<String> result = Stream.of("a", null)
+                    .gather(last())
+                    .findFirst()
+                    .orElseThrow();
+            assertTrue(result.isEmpty());
+        }
+
+        @Test
+        @DisplayName("elementAt with null element at index returns Optional.empty")
+        void elementAtNull() {
+            Optional<String> result = Stream.of("a", null, "c")
+                    .gather(elementAt(1))
+                    .findFirst()
+                    .orElseThrow();
+            assertTrue(result.isEmpty());
+        }
+
+        @Test
+        @DisplayName("throttleFirst handles negative and out-of-order timestamps")
+        void throttleFirstNegativeAndOutOfOrder() {
+            List<TimedEvent> result = Stream.of(
+                    new TimedEvent(-150, "a"), new TimedEvent(-50, "b"),
+                    new TimedEvent(50, "c"), new TimedEvent(150, "d"),
+                    new TimedEvent(120, "e")
+            ).gather(throttleFirst(100, TimedEvent::ts)).toList();
+            assertEquals(List.of(
+                    new TimedEvent(-150, "a"), new TimedEvent(-50, "b"),
+                    new TimedEvent(50, "c"), new TimedEvent(150, "d")
+            ), result);
+        }
+
+        @Test
+        @DisplayName("throttleLast handles negative and out-of-order timestamps")
+        void throttleLastNegativeAndOutOfOrder() {
+            List<TimedEvent> result = Stream.of(
+                    new TimedEvent(-150, "a"), new TimedEvent(-50, "b"),
+                    new TimedEvent(50, "c"), new TimedEvent(150, "d"),
+                    new TimedEvent(120, "e")
+            ).gather(throttleLast(100, TimedEvent::ts)).toList();
+            assertEquals(List.of(
+                    new TimedEvent(-150, "a"), new TimedEvent(-50, "b"),
+                    new TimedEvent(50, "c"), new TimedEvent(120, "e")
+            ), result);
+        }
+
+        @Test
+        @DisplayName("bufferTime handles negative and out-of-order timestamps")
+        void bufferTimeNegativeAndOutOfOrder() {
+            List<List<TimedEvent>> result = Stream.of(
+                    new TimedEvent(-150, "a"), new TimedEvent(-50, "b"),
+                    new TimedEvent(50, "c"), new TimedEvent(150, "d"),
+                    new TimedEvent(120, "e")
+            ).gather(bufferTime(100, TimedEvent::ts)).toList();
+            assertEquals(4, result.size());
+            assertEquals(List.of(new TimedEvent(-150, "a")), result.get(0));
+            assertEquals(List.of(new TimedEvent(-50, "b")), result.get(1));
+            assertEquals(List.of(new TimedEvent(50, "c")), result.get(2));
+            assertEquals(List.of(
+                    new TimedEvent(150, "d"), new TimedEvent(120, "e")
+            ), result.get(3));
+        }
+
+        @Test
+        @DisplayName("timeInterval reports negative elapsed times for out-of-order timestamps")
+        void timeIntervalNegativeElapsed() {
+            List<Timed<TimedEvent>> result = Stream.of(
+                    new TimedEvent(100, "a"), new TimedEvent(50, "b"), new TimedEvent(200, "c")
+            ).gather(timeInterval(TimedEvent::ts)).toList();
+            assertEquals(3, result.size());
+            assertEquals(0, result.get(0).elapsedMillis());
+            assertEquals(-50, result.get(1).elapsedMillis());
+            assertEquals(150, result.get(2).elapsedMillis());
+        }
+
+        @Test
+        @DisplayName("onErrorResume emits all elements from a multi-element fallback")
+        void onErrorResumeMultiElementFallback() {
+            List<Integer> result = Stream.of(2, 0, 4)
+                    .gather(onErrorResume(
+                            i -> 100 / i,
+                            e -> List.of(-1, -2)
+                    ))
+                    .toList();
+            assertEquals(List.of(50, -1, -2, 25), result);
+        }
+
+        @Test
+        @DisplayName("onErrorResume propagates an exception thrown by the fallback factory")
+        void onErrorResumeFallbackFactoryThrows() {
+            assertThrows(RuntimeException.class, () -> Stream.of("x")
+                    .gather(onErrorResume(
+                            s -> { throw new RuntimeException("err"); },
+                            e -> { throw new RuntimeException("factory boom"); }
+                    ))
+                    .toList());
+        }
+
+        @Test
+        @DisplayName("onErrorResume rejects a null fallback iterable")
+        void onErrorResumeFallbackFactoryReturnsNull() {
+            assertThrows(NullPointerException.class, () -> Stream.of("x")
+                    .gather(onErrorResume(
+                            s -> { throw new RuntimeException("err"); },
+                            e -> null
+                    ))
+                    .toList());
+        }
+    }
+
+    // ═══════════════════════════════════════════════
+    //  Short-circuiting with limit
+    // ═══════════════════════════════════════════════
+
+    @Nested
+    @DisplayName("Short-circuiting with limit")
+    class ShortCircuitingTest {
+
+        @Test
+        @DisplayName("debounce respects limit")
+        void debounceLimit() {
+            List<TimedEvent> result = Stream.of(
+                    new TimedEvent(0, "a"), new TimedEvent(50, "b"),
+                    new TimedEvent(200, "c"), new TimedEvent(230, "d"),
+                    new TimedEvent(300, "e")
+            ).gather(debounce(100, TimedEvent::ts)).limit(2).toList();
+            assertEquals(List.of(new TimedEvent(50, "b"), new TimedEvent(300, "e")), result);
+        }
+
+        @Test
+        @DisplayName("throttleFirst respects limit")
+        void throttleFirstLimit() {
+            List<TimedEvent> result = Stream.of(
+                    new TimedEvent(0, "a"), new TimedEvent(50, "b"),
+                    new TimedEvent(100, "c")
+            ).gather(throttleFirst(100, TimedEvent::ts)).limit(1).toList();
+            assertEquals(List.of(new TimedEvent(0, "a")), result);
+        }
+
+        @Test
+        @DisplayName("throttleLast respects limit")
+        void throttleLastLimit() {
+            List<TimedEvent> result = Stream.of(
+                    new TimedEvent(0, "a"), new TimedEvent(50, "b"),
+                    new TimedEvent(100, "c"), new TimedEvent(150, "d")
+            ).gather(throttleLast(100, TimedEvent::ts)).limit(1).toList();
+            assertEquals(List.of(new TimedEvent(50, "b")), result);
+        }
+
+        @Test
+        @DisplayName("bufferTime respects limit")
+        void bufferTimeLimit() {
+            List<List<TimedEvent>> result = Stream.of(
+                    new TimedEvent(10, "a"), new TimedEvent(50, "b"),
+                    new TimedEvent(110, "c"), new TimedEvent(150, "d")
+            ).gather(bufferTime(100, TimedEvent::ts)).limit(1).toList();
+            assertEquals(1, result.size());
+            assertEquals(List.of(new TimedEvent(10, "a"), new TimedEvent(50, "b")), result.get(0));
+        }
+
+        @Test
+        @DisplayName("timestamp respects limit")
+        void timestampLimit() {
+            List<Timestamped<TimedEvent>> result = Stream.of(
+                    new TimedEvent(10, "a"), new TimedEvent(50, "b")
+            ).gather(timestamp(TimedEvent::ts)).limit(1).toList();
+            assertEquals(1, result.size());
+            assertEquals(10, result.get(0).timestamp());
+        }
+
+        @Test
+        @DisplayName("timeInterval respects limit")
+        void timeIntervalLimit() {
+            List<Timed<TimedEvent>> result = Stream.of(
+                    new TimedEvent(10, "a"), new TimedEvent(50, "b")
+            ).gather(timeInterval(TimedEvent::ts)).limit(1).toList();
+            assertEquals(1, result.size());
+            assertEquals(0, result.get(0).elapsedMillis());
+        }
+
+        @Test
+        @DisplayName("doOnNext respects limit and side-effects stop")
+        void doOnNextLimit() {
+            List<Integer> sideEffects = new ArrayList<>();
+            List<Integer> result = Stream.of(1, 2, 3)
+                    .gather(doOnNext(sideEffects::add))
+                    .limit(2)
+                    .toList();
+            assertEquals(List.of(1, 2), result);
+            assertEquals(List.of(1, 2), sideEffects);
+        }
+
+        @Test
+        @DisplayName("doOnComplete fires with limit")
+        void doOnCompleteLimit() {
+            AtomicBoolean completed = new AtomicBoolean(false);
+            List<Integer> result = Stream.of(1, 2, 3)
+                    .gather(doOnComplete(() -> completed.set(true)))
+                    .limit(2)
+                    .toList();
+            assertEquals(List.of(1, 2), result);
+            assertTrue(completed.get());
+        }
+
+        @Test
+        @DisplayName("doOnError passes through with limit")
+        void doOnErrorLimit() {
+            List<Throwable> errors = new ArrayList<>();
+            List<Integer> result = Stream.of(1, 2, 3)
+                    .gather(doOnError(errors::add))
+                    .limit(2)
+                    .toList();
+            assertEquals(List.of(1, 2), result);
+            assertTrue(errors.isEmpty());
+        }
+
+        @Test
+        @DisplayName("doFinally fires with limit")
+        void doFinallyLimit() {
+            AtomicReference<String> signal = new AtomicReference<>();
+            List<Integer> result = Stream.of(1, 2, 3)
+                    .gather(doFinally(signal::set))
+                    .limit(2)
+                    .toList();
+            assertEquals(List.of(1, 2), result);
+            assertEquals("complete", signal.get());
+        }
+
+        @Test
+        @DisplayName("materialize respects limit")
+        void materializeLimit() {
+            List<Notification<String>> result = Stream.of("a", "b", "c")
+                    .gather(ReactiveGatherers.<String>materialize())
+                    .limit(2)
+                    .toList();
+            assertEquals(2, result.size());
+            assertInstanceOf(Notification.OnNext.class, result.get(0));
+            assertInstanceOf(Notification.OnNext.class, result.get(1));
+        }
+
+        @Test
+        @DisplayName("dematerialize respects limit")
+        void dematerializeLimit() {
+            List<String> result = Stream.of("a", "b", "c")
+                    .gather(ReactiveGatherers.<String>materialize())
+                    .gather(dematerialize())
+                    .limit(1)
+                    .toList();
+            assertEquals(List.of("a"), result);
+        }
+
+        @Test
+        @DisplayName("onErrorReturn respects limit")
+        void onErrorReturnLimit() {
+            List<String> result = Stream.of(1, 0, 2, 0, 3)
+                    .gather(onErrorReturn(i -> {
+                        if (i == 0) throw new RuntimeException("zero");
+                        return String.valueOf(10 / i);
+                    }, "ERROR"))
+                    .limit(3)
+                    .toList();
+            assertEquals(List.of("10", "ERROR", "5"), result);
+        }
+
+        @Test
+        @DisplayName("onErrorResume respects limit through fallback")
+        void onErrorResumeLimit() {
+            List<Integer> result = Stream.of(2, 0, 4)
+                    .gather(onErrorResume(
+                            i -> 100 / i,
+                            e -> List.of(-1, -2)
+                    ))
+                    .limit(3)
+                    .toList();
+            assertEquals(List.of(50, -1, -2), result);
+        }
+
+        @Test
+        @DisplayName("retry respects limit")
+        void retryLimit() {
+            List<Integer> result = Stream.of(1, 2, 3)
+                    .gather(retry(i -> i * 10, 3))
+                    .limit(2)
+                    .toList();
+            assertEquals(List.of(10, 20), result);
+        }
+
+        @Test
+        @DisplayName("repeat respects limit")
+        void repeatLimit() {
+            List<Integer> result = Stream.of(1, 2, 3)
+                    .gather(repeat(2))
+                    .limit(5)
+                    .toList();
+            assertEquals(List.of(1, 2, 3, 1, 2), result);
+        }
+
+        @Test
+        @DisplayName("defaultIfEmpty respects limit")
+        void defaultIfEmptyLimit() {
+            List<Integer> emptyResult = Stream.<Integer>empty()
+                    .gather(defaultIfEmpty(42))
+                    .limit(1)
+                    .toList();
+            assertEquals(List.of(42), emptyResult);
+
+            List<Integer> nonEmptyResult = Stream.of(1, 2)
+                    .gather(defaultIfEmpty(42))
+                    .limit(1)
+                    .toList();
+            assertEquals(List.of(1), nonEmptyResult);
+        }
+
+        @Test
+        @DisplayName("switchIfEmpty respects limit")
+        void switchIfEmptyLimit() {
+            List<Integer> emptyResult = Stream.<Integer>empty()
+                    .gather(switchIfEmpty(List.of(10, 20)))
+                    .limit(1)
+                    .toList();
+            assertEquals(List.of(10), emptyResult);
+
+            List<Integer> nonEmptyResult = Stream.of(1, 2)
+                    .gather(switchIfEmpty(List.of(99)))
+                    .limit(1)
+                    .toList();
+            assertEquals(List.of(1), nonEmptyResult);
+        }
+
+        @Test
+        @DisplayName("startWith respects limit")
+        void startWithLimit() {
+            List<Integer> result = Stream.of(3, 4)
+                    .gather(startWith(List.of(1, 2)))
+                    .limit(3)
+                    .toList();
+            assertEquals(List.of(1, 2, 3), result);
+        }
+
+        @Test
+        @DisplayName("concatWith respects limit")
+        void concatWithLimit() {
+            List<Integer> result = Stream.of(1, 2)
+                    .gather(concatWith(List.of(3, 4)))
+                    .limit(3)
+                    .toList();
+            assertEquals(List.of(1, 2, 3), result);
+        }
+
+        @Test
+        @DisplayName("delay respects limit")
+        void delayLimit() {
+            List<TimedEvent> result = Stream.of(
+                    new TimedEvent(200, "c"), new TimedEvent(0, "a"),
+                    new TimedEvent(100, "b")
+            ).gather(delay(TimedEvent::ts)).limit(2).toList();
+            assertEquals(List.of(new TimedEvent(0, "a"), new TimedEvent(100, "b")), result);
+        }
+
+        @Test
+        @DisplayName("elementAt respects limit")
+        void elementAtLimit() {
+            Optional<String> result = Stream.of("a", "b", "c")
+                    .gather(elementAt(1))
+                    .limit(1)
+                    .findFirst()
+                    .orElseThrow();
+            assertEquals(Optional.of("b"), result);
+        }
+
+        @Test
+        @DisplayName("first respects limit")
+        void firstLimit() {
+            Optional<String> result = Stream.of("a", "b")
+                    .gather(first())
+                    .limit(1)
+                    .findFirst()
+                    .orElseThrow();
+            assertEquals(Optional.of("a"), result);
+        }
+
+        @Test
+        @DisplayName("last respects limit")
+        void lastLimit() {
+            Optional<String> result = Stream.of("a", "b")
+                    .gather(last())
+                    .limit(1)
+                    .findFirst()
+                    .orElseThrow();
+            assertEquals(Optional.of("b"), result);
+        }
+
+        @Test
+        @DisplayName("skipLast respects limit")
+        void skipLastLimit() {
+            List<Integer> result = Stream.of(1, 2, 3, 4, 5)
+                    .gather(skipLast(2))
+                    .limit(2)
+                    .toList();
+            assertEquals(List.of(1, 2), result);
+        }
+
+        @Test
+        @DisplayName("takeLast respects limit")
+        void takeLastLimit() {
+            List<Integer> result = Stream.of(1, 2, 3, 4, 5)
+                    .gather(takeLast(3))
+                    .limit(2)
+                    .toList();
+            assertEquals(List.of(3, 4), result);
+        }
+
+        @Test
+        @DisplayName("distinctUntilChanged respects limit")
+        void distinctUntilChangedLimit() {
+            List<Integer> result = Stream.of(1, 1, 2, 3)
+                    .gather(distinctUntilChanged())
+                    .limit(2)
+                    .toList();
+            assertEquals(List.of(1, 2), result);
+        }
+
+        @Test
+        @DisplayName("withLatestFrom respects limit")
+        void withLatestFromLimit() {
+            List<String> result = Stream.of(1, 2, 3)
+                    .gather(withLatestFrom(List.of("a", "b", "c"), (i, s) -> i + ":" + s))
+                    .limit(2)
+                    .toList();
+            assertEquals(List.of("1:a", "2:b"), result);
+        }
+
+        @Test
+        @DisplayName("scan respects limit")
+        void scanLimit() {
+            List<Integer> result = Stream.of(1, 2, 3)
+                    .gather(scan(0, Integer::sum))
+                    .limit(2)
+                    .toList();
+            assertEquals(List.of(0, 1), result);
+        }
+
+        @Test
+        @DisplayName("reduceWith respects limit")
+        void reduceWithLimit() {
+            Integer result = Stream.of(1, 2, 3)
+                    .gather(reduceWith(0, Integer::sum))
+                    .limit(1)
+                    .findFirst()
+                    .orElseThrow();
+            assertEquals(6, result);
+        }
+
+        @Test
+        @DisplayName("collectList respects limit")
+        void collectListLimit() {
+            List<Integer> result = Stream.of(1, 2, 3)
+                    .gather(collectList())
+                    .limit(1)
+                    .findFirst()
+                    .orElseThrow();
+            assertEquals(List.of(1, 2, 3), result);
+        }
+
+        @Test
+        @DisplayName("mapWithIndex respects limit")
+        void mapWithIndexLimit() {
+            List<String> result = Stream.of("a", "b", "c")
+                    .gather(mapWithIndex((idx, val) -> idx + ":" + val))
+                    .limit(2)
+                    .toList();
+            assertEquals(List.of("0:a", "1:b"), result);
+        }
+    }
+
+    // ═══════════════════════════════════════════════
+    //  Null argument validation
+    // ═══════════════════════════════════════════════
+
+    @Nested
+    @DisplayName("Null argument validation")
+    class NullArgumentValidationTest {
+
+        @Test
+        @DisplayName("factory methods reject null arguments")
+        void nullArguments() {
+            assertThrows(NullPointerException.class, () -> debounce(100, null));
+            assertThrows(NullPointerException.class, () -> throttleFirst(100, null));
+            assertThrows(NullPointerException.class, () -> throttleLast(100, null));
+            assertThrows(NullPointerException.class, () -> bufferTime(100, null));
+            assertThrows(NullPointerException.class, () -> timestamp(null));
+            assertThrows(NullPointerException.class, () -> timeInterval(null));
+            assertThrows(NullPointerException.class, () -> doOnNext(null));
+            assertThrows(NullPointerException.class, () -> doOnComplete(null));
+            assertThrows(NullPointerException.class, () -> doOnError(null));
+            assertThrows(NullPointerException.class, () -> doFinally(null));
+            assertThrows(NullPointerException.class, () -> onErrorReturn((Function<String, String>) null, "x"));
+            assertThrows(NullPointerException.class, () -> onErrorResume((String s) -> s, (Function<Exception, ? extends Iterable<? extends String>>) null));
+            assertThrows(NullPointerException.class, () -> onErrorResume((Function<String, String>) null, e -> List.of()));
+            assertThrows(NullPointerException.class, () -> retry((Function<String, String>) null, 1));
+            assertThrows(NullPointerException.class, () -> startWith(null));
+            assertThrows(NullPointerException.class, () -> concatWith(null));
+            assertThrows(NullPointerException.class, () -> switchIfEmpty(null));
+            assertThrows(NullPointerException.class, () -> delay(null));
+            assertThrows(NullPointerException.class, () -> withLatestFrom(null, (a, b) -> a));
+            assertThrows(NullPointerException.class, () -> withLatestFrom(List.of(), (BiFunction<String, String, String>) null));
+            assertThrows(NullPointerException.class, () -> scan(0, null));
+            assertThrows(NullPointerException.class, () -> reduceWith(0, null));
+            assertThrows(NullPointerException.class, () -> mapWithIndex((BiFunction<Long, String, String>) null));
+            assertThrows(NullPointerException.class, () -> distinctUntilChanged((Function<String, String>) null));
         }
     }
 }

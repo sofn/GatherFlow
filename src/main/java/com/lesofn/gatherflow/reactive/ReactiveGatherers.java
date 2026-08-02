@@ -93,21 +93,25 @@ public final class ReactiveGatherers {
         Objects.requireNonNull(timestampExtractor);
         return Gatherer.ofSequential(
                 () -> new Object() {
-                    T pending = null;
+                    T pending;
                     long pendingTs = Long.MIN_VALUE;
+                    boolean hasPending = false;
                 },
                 (state, element, downstream) -> {
                     long ts = timestampExtractor.applyAsLong(element);
-                    if (state.pending != null && (ts - state.pendingTs) > timeout) {
-                        downstream.push(state.pending);
+                    if (state.hasPending && (ts - state.pendingTs) > timeout) {
+                        if (!downstream.push(state.pending)) {
+                            return false;
+                        }
                     }
                     state.pending = element;
                     state.pendingTs = ts;
+                    state.hasPending = true;
                     return true;
                 },
                 (state, downstream) -> {
-                    if (state.pending != null) {
-                        downstream.push(state.pending);
+                    if (state.hasPending && !downstream.push(state.pending)) {
+                        return;
                     }
                 }
         );
@@ -136,12 +140,14 @@ public final class ReactiveGatherers {
         Objects.requireNonNull(timestampExtractor);
         return Gatherer.ofSequential(
                 () -> new Object() {
-                    long windowStart = Long.MIN_VALUE;
+                    boolean firstWindowSeen = false;
+                    long windowStart = 0L;
                 },
                 (state, element, downstream) -> {
                     long ts = timestampExtractor.applyAsLong(element);
-                    long currentWindowStart = (ts / windowSize) * windowSize;
-                    if (currentWindowStart != state.windowStart) {
+                    long currentWindowStart = Math.floorDiv(ts, windowSize) * windowSize;
+                    if (!state.firstWindowSeen || currentWindowStart != state.windowStart) {
+                        state.firstWindowSeen = true;
                         state.windowStart = currentWindowStart;
                         return downstream.push(element);
                     }
@@ -156,6 +162,11 @@ public final class ReactiveGatherers {
 
     /**
      * Emit the last element in each time window of the specified duration.
+     *
+     * <p>Timestamps are bucketed with {@link Math#floorDiv(long, long)} so that
+     * negative and slightly out-of-order timestamps are handled correctly.
+     * When a timestamp advances past the end of a previously seen bucket, all
+     * complete buckets are emitted in order.</p>
      *
      * <p>RxJava: {@code observable.sample(windowSize, unit)} / {@code throttleLast}</p>
      * <p>Reactor: {@code flux.sample(Duration)}</p>
@@ -172,26 +183,32 @@ public final class ReactiveGatherers {
         Objects.requireNonNull(timestampExtractor);
         return Gatherer.ofSequential(
                 () -> new Object() {
-                    final LinkedHashMap<Long, T> buckets = new LinkedHashMap<>();
-                    long currentBucket = Long.MIN_VALUE;
+                    final NavigableMap<Long, T> buckets = new TreeMap<>();
                 },
                 (state, element, downstream) -> {
                     long ts = timestampExtractor.applyAsLong(element);
-                    long bucket = (ts / windowSize) * windowSize;
-                    // When moving to a new bucket, emit all previous complete buckets
-                    if (state.currentBucket != Long.MIN_VALUE && bucket > state.currentBucket) {
-                        for (T value : state.buckets.values()) {
-                            downstream.push(value);
+                    long bucket = Math.floorDiv(ts, windowSize) * windowSize;
+                    var it = state.buckets.entrySet().iterator();
+                    while (it.hasNext()) {
+                        var entry = it.next();
+                        if (entry.getKey() + windowSize <= ts) {
+                            if (!downstream.push(entry.getValue())) {
+                                state.buckets.clear();
+                                return false;
+                            }
+                            it.remove();
+                        } else {
+                            break;
                         }
-                        state.buckets.clear();
                     }
-                    state.buckets.put(bucket, element); // keep last per bucket
-                    state.currentBucket = bucket;
+                    state.buckets.put(bucket, element);
                     return true;
                 },
                 (state, downstream) -> {
                     for (T value : state.buckets.values()) {
-                        downstream.push(value);
+                        if (!downstream.push(value)) {
+                            return;
+                        }
                     }
                 }
         );
@@ -204,6 +221,11 @@ public final class ReactiveGatherers {
     /**
      * Buffer elements into time-bucketed lists. Each bucket covers a fixed
      * time span, and elements are grouped by their timestamp's bucket.
+     *
+     * <p>Timestamps are bucketed with {@link Math#floorDiv(long, long)} so that
+     * negative and slightly out-of-order timestamps are handled correctly. When a
+     * timestamp advances past the end of a previously seen bucket, all complete
+     * buckets are emitted in order.</p>
      *
      * <p>RxJava: {@code observable.buffer(timespan, unit)}</p>
      * <p>Reactor: {@code flux.buffer(Duration)}</p>
@@ -218,26 +240,32 @@ public final class ReactiveGatherers {
         Objects.requireNonNull(timestampExtractor);
         return Gatherer.ofSequential(
                 () -> new Object() {
-                    final LinkedHashMap<Long, List<T>> buckets = new LinkedHashMap<>();
-                    long currentBucket = Long.MIN_VALUE;
+                    final NavigableMap<Long, List<T>> buckets = new TreeMap<>();
                 },
                 (state, element, downstream) -> {
                     long ts = timestampExtractor.applyAsLong(element);
-                    long bucket = (ts / timespan) * timespan;
-                    // When moving to a new bucket, emit all previous complete buckets
-                    if (state.currentBucket != Long.MIN_VALUE && bucket > state.currentBucket) {
-                        for (List<T> b : state.buckets.values()) {
-                            downstream.push(List.copyOf(b));
+                    long bucket = Math.floorDiv(ts, timespan) * timespan;
+                    var it = state.buckets.entrySet().iterator();
+                    while (it.hasNext()) {
+                        var entry = it.next();
+                        if (entry.getKey() + timespan <= ts) {
+                            if (!downstream.push(Collections.unmodifiableList(new ArrayList<>(entry.getValue())))) {
+                                state.buckets.clear();
+                                return false;
+                            }
+                            it.remove();
+                        } else {
+                            break;
                         }
-                        state.buckets.clear();
                     }
                     state.buckets.computeIfAbsent(bucket, k -> new ArrayList<>()).add(element);
-                    state.currentBucket = bucket;
                     return true;
                 },
                 (state, downstream) -> {
                     for (List<T> bucket : state.buckets.values()) {
-                        downstream.push(List.copyOf(bucket));
+                        if (!downstream.push(Collections.unmodifiableList(new ArrayList<>(bucket)))) {
+                            return;
+                        }
                     }
                 }
         );
@@ -335,16 +363,17 @@ public final class ReactiveGatherers {
     }
 
     /**
-     * Invoke a side-effect if the integrator throws an exception.
-     * Catches exceptions from the integrator function and calls the error handler,
-     * then re-throws to propagate the error.
+     * Invoke a side-effect if {@code downstream.push(...)} throws an exception.
+     * Catches unchecked exceptions ({@link RuntimeException} / {@link Error})
+     * thrown while pushing an element downstream, calls the error handler, then
+     * re-throws to propagate the error.
      *
      * <p>RxJava: {@code observable.doOnError(consumer)}</p>
      * <p>Reactor: {@code flux.doOnError(consumer)}</p>
      *
      * <p><em>Note:</em> Java Streams do not have an error channel. This operator
-     * only catches exceptions thrown by upstream operations within the
-     * integrator, not downstream exceptions.</p>
+     * only observes errors thrown by {@code downstream.push(...)} (for example,
+     * from downstream operators), not by upstream gatherers or the source.</p>
      *
      * @param errorHandler  side-effect to perform on error
      * @return a Gatherer that observes errors and re-throws them
@@ -355,7 +384,7 @@ public final class ReactiveGatherers {
                 (_, element, downstream) -> {
                     try {
                         return downstream.push(element);
-                    } catch (Exception e) {
+                    } catch (RuntimeException | Error e) {
                         errorHandler.accept(e);
                         throw e;
                     }
@@ -416,8 +445,15 @@ public final class ReactiveGatherers {
         return Gatherer.ofSequential(
                 (_, notification, downstream) -> {
                     switch (notification) {
-                        case Notification.OnNext<T> onNext -> downstream.push(onNext.value());
-                        case Notification.OnError<T> onError -> throw new RuntimeException(onError.error());
+                        case Notification.OnNext<T> onNext -> {
+                            return downstream.push(onNext.value());
+                        }
+                        case Notification.OnError<T> onError -> {
+                            Throwable t = onError.error();
+                            if (t instanceof RuntimeException re) throw re;
+                            if (t instanceof Error er) throw er;
+                            throw new RuntimeException(t);
+                        }
                         case Notification.OnComplete<T> ignored -> {} // end of stream
                     }
                     return true;
@@ -430,8 +466,8 @@ public final class ReactiveGatherers {
     // ═══════════════════════════════════════════════
 
     /**
-     * If a mapping function throws an exception, emit a fallback value instead.
-     * This wraps a map operation with error handling.
+     * If a mapping function throws a {@link RuntimeException} or {@link Error},
+     * emit a fallback value instead. This wraps a map operation with error handling.
      *
      * <p>RxJava: {@code observable.onErrorReturn(fallback)}</p>
      * <p>Reactor: {@code flux.onErrorReturn(fallback)}</p>
@@ -448,7 +484,7 @@ public final class ReactiveGatherers {
                 (_, element, downstream) -> {
                     try {
                         return downstream.push(mapper.apply(element));
-                    } catch (Exception e) {
+                    } catch (RuntimeException | Error e) {
                         return downstream.push(fallback);
                     }
                 }
@@ -460,8 +496,10 @@ public final class ReactiveGatherers {
     // ═══════════════════════════════════════════════
 
     /**
-     * If a mapping function throws an exception, switch to a fallback iterable
-     * for that element.
+     * If a mapping function throws a {@link RuntimeException} or {@link Error},
+     * switch to a fallback iterable for that element. The fallback factory is
+     * invoked with the caught {@link RuntimeException}; {@link Error}s are
+     * re-thrown without invoking the factory.
      *
      * <p>RxJava: {@code observable.onErrorResumeNext(fallbackFactory)}</p>
      * <p>Reactor: {@code flux.onErrorResume(fallbackFunction)}</p>
@@ -479,8 +517,15 @@ public final class ReactiveGatherers {
                 (_, element, downstream) -> {
                     try {
                         return downstream.push(mapper.apply(element));
-                    } catch (Exception e) {
-                        for (R r : fallbackFactory.apply(e)) {
+                    } catch (RuntimeException | Error e) {
+                        Iterable<? extends R> fallback;
+                        if (e instanceof RuntimeException re) {
+                            fallback = Objects.requireNonNull(fallbackFactory.apply(re),
+                                    "fallbackFactory returned null");
+                        } else {
+                            throw e;
+                        }
+                        for (R r : fallback) {
                             if (!downstream.push(r)) return false;
                         }
                         return true;
@@ -515,14 +560,16 @@ public final class ReactiveGatherers {
         Objects.requireNonNull(mapper);
         return Gatherer.ofSequential(
                 (_, element, downstream) -> {
-                    Exception lastException = null;
+                    Throwable lastException = null;
                     for (int attempt = 0; attempt <= maxRetries; attempt++) {
                         try {
                             return downstream.push(mapper.apply(element));
-                        } catch (Exception e) {
+                        } catch (RuntimeException | Error e) {
                             lastException = e;
                         }
                     }
+                    if (lastException instanceof RuntimeException re) throw re;
+                    if (lastException instanceof Error er) throw er;
                     throw new RuntimeException("Retry exhausted after " + maxRetries + " retries", lastException);
                 }
         );
@@ -553,7 +600,9 @@ public final class ReactiveGatherers {
                 (state, downstream) -> {
                     for (int i = 0; i < times; i++) {
                         for (T e : state.buffer) {
-                            downstream.push(e);
+                            if (!downstream.push(e)) {
+                                return;
+                            }
                         }
                     }
                 }
@@ -612,7 +661,7 @@ public final class ReactiveGatherers {
                 (state, downstream) -> {
                     if (!state.hasElement) {
                         for (T t : fallback) {
-                            downstream.push(t);
+                            if (!downstream.push(t)) return;
                         }
                     }
                 }
@@ -639,7 +688,10 @@ public final class ReactiveGatherers {
                 (state, element, downstream) -> {
                     if (!state.emittedPrefix) {
                         for (T t : prefix) {
-                            downstream.push(t);
+                            if (!downstream.push(t)) {
+                                state.emittedPrefix = true;
+                                return false;
+                            }
                         }
                         state.emittedPrefix = true;
                     }
@@ -648,7 +700,7 @@ public final class ReactiveGatherers {
                 (state, downstream) -> {
                     if (!state.emittedPrefix) {
                         for (T t : prefix) {
-                            downstream.push(t);
+                            if (!downstream.push(t)) return;
                         }
                     }
                 }
@@ -674,7 +726,7 @@ public final class ReactiveGatherers {
                 (_, element, downstream) -> downstream.push(element),
                 (_, downstream) -> {
                     for (T t : suffix) {
-                        downstream.push(t);
+                        if (!downstream.push(t)) return;
                     }
                 }
         );
@@ -710,7 +762,7 @@ public final class ReactiveGatherers {
                 (state, downstream) -> {
                     state.buffer.sort(Comparator.comparingLong(timestampExtractor::applyAsLong));
                     for (T e : state.buffer) {
-                        downstream.push(e);
+                        if (!downstream.push(e)) return;
                     }
                 }
         );
@@ -735,13 +787,15 @@ public final class ReactiveGatherers {
                 () -> new Object() { long currentIndex = 0; },
                 (state, element, downstream) -> {
                     if (state.currentIndex == index) {
-                        downstream.push(Optional.of(element));
+                        downstream.push(Optional.ofNullable(element));
                         return false; // short-circuit
                     }
                     state.currentIndex++;
                     return true;
                 },
-                (state, downstream) -> downstream.push(Optional.empty())
+                (state, downstream) -> {
+                    downstream.push(Optional.empty());
+                }
         );
     }
 
@@ -760,10 +814,12 @@ public final class ReactiveGatherers {
     public static <T> Gatherer<T, ?, Optional<T>> first() {
         return Gatherer.ofSequential(
                 (_, element, downstream) -> {
-                    downstream.push(Optional.of(element));
+                    downstream.push(Optional.ofNullable(element));
                     return false; // short-circuit after first
                 },
-                (_, downstream) -> downstream.push(Optional.empty())
+                (_, downstream) -> {
+                    downstream.push(Optional.empty());
+                }
         );
     }
 
@@ -781,15 +837,19 @@ public final class ReactiveGatherers {
      */
     public static <T> Gatherer<T, ?, Optional<T>> last() {
         return Gatherer.ofSequential(
-                () -> new Object() { T lastElement = null; boolean hasElement = false; },
+                () -> new Object() { T lastElement; boolean hasElement = false; },
                 (state, element, downstream) -> {
                     state.lastElement = element;
                     state.hasElement = true;
                     return true;
                 },
-                (state, downstream) -> downstream.push(
-                        state.hasElement ? Optional.of(state.lastElement) : Optional.empty()
-                )
+                (state, downstream) -> {
+                    if (state.hasElement) {
+                        downstream.push(Optional.ofNullable(state.lastElement));
+                    } else {
+                        downstream.push(Optional.empty());
+                    }
+                }
         );
     }
 
@@ -810,7 +870,7 @@ public final class ReactiveGatherers {
         if (n < 0) throw new IllegalArgumentException("n must be >= 0, got " + n);
         if (n == 0) return Gatherer.ofSequential((_, element, downstream) -> downstream.push(element));
         return Gatherer.ofSequential(
-                () -> new Object() { final ArrayDeque<T> queue = new ArrayDeque<>(); },
+                () -> new Object() { final LinkedList<T> queue = new LinkedList<>(); },
                 (state, element, downstream) -> {
                     state.queue.addLast(element);
                     if (state.queue.size() > n) {
@@ -834,7 +894,7 @@ public final class ReactiveGatherers {
         if (n < 0) throw new IllegalArgumentException("n must be >= 0, got " + n);
         if (n == 0) return Gatherer.ofSequential((_, element, downstream) -> true);
         return Gatherer.ofSequential(
-                () -> new Object() { final ArrayDeque<T> queue = new ArrayDeque<>(); },
+                () -> new Object() { final LinkedList<T> queue = new LinkedList<>(); },
                 (state, element, downstream) -> {
                     state.queue.addLast(element);
                     if (state.queue.size() > n) {
@@ -844,7 +904,7 @@ public final class ReactiveGatherers {
                 },
                 (state, downstream) -> {
                     for (T e : state.queue) {
-                        downstream.push(e);
+                        if (!downstream.push(e)) return;
                     }
                 }
         );
@@ -937,11 +997,9 @@ public final class ReactiveGatherers {
                     boolean hasLatest = false;
                 },
                 (state, element, downstream) -> {
-                    // Advance other iterator as far as possible (non-blocking)
-                    while (state.otherIter.hasNext()) {
+                    if (state.otherIter.hasNext()) {
                         state.latestOther = state.otherIter.next();
                         state.hasLatest = true;
-                        break; // take only one per main element
                     }
                     if (state.hasLatest) {
                         return downstream.push(combiner.apply(element, state.latestOther));
@@ -969,7 +1027,10 @@ public final class ReactiveGatherers {
                 () -> new Object() { A acc = seed; boolean emittedSeed = false; },
                 (state, element, downstream) -> {
                     if (!state.emittedSeed) {
-                        downstream.push(state.acc);
+                        if (!downstream.push(state.acc)) {
+                            state.emittedSeed = true;
+                            return false;
+                        }
                         state.emittedSeed = true;
                     }
                     state.acc = accumulator.apply(state.acc, element);
@@ -1028,7 +1089,7 @@ public final class ReactiveGatherers {
                     state.buffer.add(element);
                     return true;
                 },
-                (state, downstream) -> downstream.push(List.copyOf(state.buffer))
+                (state, downstream) -> downstream.push(Collections.unmodifiableList(new ArrayList<>(state.buffer)))
         );
     }
 
@@ -1049,9 +1110,8 @@ public final class ReactiveGatherers {
         return Gatherer.ofSequential(
                 () -> new Object() { long index = 0; },
                 (state, element, downstream) -> {
-                    downstream.push(combiner.apply(state.index, element));
-                    state.index++;
-                    return true;
+                    long idx = state.index++;
+                    return downstream.push(combiner.apply(idx, element));
                 }
         );
     }
