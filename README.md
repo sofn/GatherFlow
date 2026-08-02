@@ -2,13 +2,41 @@
 
 [中文版](./README.zh-CN.md)
 
-**GatherFlow** demonstrates the power of Java 25's `Stream.gather()` API ([JEP 485](https://openjdk.org/jeps/485)) by implementing three families of stream operators modeled after well-known frameworks:
+> **API Stability: Experimental**
+>
+> GatherFlow is a proof-of-concept/experimental library exploring Java 25's `Stream.gather()` API. Public APIs may change in any release until a stable version is announced.
+
+**GatherFlow** demonstrates Java 25's `Stream.gather()` API ([JEP 485](https://openjdk.org/jeps/485)) by providing gatherers that simulate a **subset** of Scala/Vavr sequence, Apache Flink windowing, and RxJava/Reactor reactive semantics on **bounded, pull-based Java Streams**. It is not a replacement for Flink, RxJava, or Reactor, and it does not faithfully replicate their runtime behavior.
 
 | Module | Inspiration | Description |
 |---|---|---|
 | `sequence` | Scala Collections / Vavr | Functional sequence operators |
 | `window` | Apache Flink | Windowing & keyed stream operators |
-| `reactive` | RxJava / Project Reactor | Reactive-style timing & error operators |
+| `reactive` | RxJava / Project Reactor | Reactive-style timing & composition operators |
+
+---
+
+## Project Goals and Non-Goals
+
+**Goals**
+
+- Explore idiomatic uses of the JEP 485 `Gatherer` API.
+- Provide deterministic, test-friendly operators for in-memory, bounded streams.
+- Offer a unified vocabulary for common sequence/window/reactive-style transformations on `java.util.stream.Stream`.
+
+**Non-Goals**
+
+- Distributed or parallel stream processing.
+- Unbounded sources, event time, watermarks, or async scheduling.
+- Replacing Flink, Kafka Streams, RxJava, or Project Reactor in production.
+- Exactly-once semantics, checkpoints, or distributed state.
+
+> **What this library is NOT**
+>
+> - It is **not** an event-time stream processor (no watermarks, no event time).
+> - It has **no** checkpointing, distributed state, or exactly-once guarantees.
+> - It does **not** support unbounded sources or wall-clock scheduling.
+> - All gatherers are **sequential-only**; parallel streams are not supported.
 
 ---
 
@@ -19,10 +47,57 @@
 
 ---
 
+## Getting Started
+
+All gatherer factories are `public static` methods on `SequenceGatherers`, `WindowGatherers`, and `ReactiveGatherers`. Use `import static ...*` to call them directly inside `Stream.gather(...)`:
+
+```java
+import java.util.List;
+import java.util.stream.Stream;
+import static com.lesofn.gatherflow.sequence.SequenceGatherers.scanLeft;
+import static com.lesofn.gatherflow.window.WindowGatherers.tumblingWindow;
+import static com.lesofn.gatherflow.window.WindowGatherers.windowReduce;
+
+public class QuickStart {
+    public static void main(String[] args) {
+        List<Integer> sums = Stream.of(1, 2, 3, 4, 5, 6)
+                .gather(tumblingWindow(2))
+                .gather(windowReduce(Integer::sum))
+                .toList();
+        System.out.println(sums); // [3, 7, 11]
+
+        List<Integer> scanned = Stream.of(1, 2, 3, 4, 5)
+                .gather(scanLeft(0, Integer::sum))
+                .toList();
+        System.out.println(scanned); // [0, 1, 3, 6, 10, 15]
+    }
+}
+```
+
+Compile and run with Java 25 preview enabled:
+
+```bash
+javac --enable-preview --release 25 -cp gatherflow-*.jar QuickStart.java
+java --enable-preview -cp .:gatherflow-*.jar QuickStart
+```
+
+In a Gradle project, add this project as a dependency and ensure that compile and exec tasks enable preview:
+
+```groovy
+tasks.withType(JavaCompile).configureEach {
+    options.compilerArgs += ['--enable-preview']
+}
+tasks.withType(JavaExec).configureEach {
+    jvmArgs += ['--enable-preview']
+}
+```
+
+---
+
 ## Build & Test
 
 ```bash
-# Run all tests with coverage
+# Run all tests with coverage and verification
 ./gradlew check
 
 # Run tests only
@@ -42,8 +117,8 @@ Coverage reports are generated under `build/reports/jacoco/`.
 
 | Operator | Signature | Description | Inspired by |
 |---|---|---|---|
-| `scanLeft` | `(zero, BiFunction)` | Left prefix scan, emits each step including initial | Scala `scanLeft` |
-| `scanRight` | `(zero, BiFunction)` | Right suffix scan, buffers then emits reversed steps | Scala `scanRight` |
+| `scanLeft` | `(zero, BiFunction<A, T, A>)` | Left prefix scan, emits each step including initial | Scala `scanLeft` |
+| `scanRight` | `(zero, BiFunction<T, A, A>)` | Right suffix scan, buffers then emits reversed steps; `BiFunction` receives `(element, accumulator)` | Scala `scanRight` |
 | `sliding` | `(size)` / `(size, step)` | Overlapping sliding windows | Scala `sliding` |
 | `grouped` | `(size)` | Non-overlapping fixed-size chunks | Scala `grouped` |
 | `intersperse` | `(separator)` | Insert separator between consecutive elements | Vavr / Scala |
@@ -58,7 +133,7 @@ Coverage reports are generated under `build/reports/jacoco/`.
 | `peek` | `(Consumer)` | Side-effect observation, pass through unchanged | Vavr `peek` |
 | `prepend` | `(element)` | Emit element first, then stream | Vavr `prepend` |
 | `append` | `(element)` | Emit stream, then element | Vavr `append` |
-| `cycle` | `(times)` | Repeat stream elements up to N total | Scala / Vavr |
+| `cycle` | `(int times)` | Repeat elements up to `times` total emitted; `[1,2,3].cycle(7) → [1,2,3,1,2,3,1]` | Scala / Vavr |
 | `interleave` | `(Iterable)` | Alternate elements from stream and iterable | Vavr `interleave` |
 | `reverse` | `()` | Emit elements in reverse order | Scala `reverse` |
 | `slice` | `(fromIndex, toIndex)` | Emit elements in index range [from, to) | Scala `slice` |
@@ -88,9 +163,10 @@ PartitionResult<Integer> p = Stream.of(1, 2, 3, 4, 5)
 
 ### `WindowGatherers` — Apache Flink Inspired
 
-> Simulates Flink's stream windowing semantics on bounded Java Streams.
+> Simulates a subset of Flink's windowing semantics on bounded Java Streams.
 > All window operators emit [`Window<T>`](src/main/java/com/lesofn/gatherflow/window/Window.java)
 > records with metadata (windowId, startIndex, endIndex, elements).
+> Time-based windows use element-local timestamps; there is no event time or watermarks.
 
 #### Window Operators
 
@@ -110,6 +186,8 @@ PartitionResult<Integer> p = Stream.of(1, 2, 3, 4, 5)
 | `windowReduce(BinaryOperator)` | Reduce window elements to a single value | `WindowedStream.reduce()` |
 | `windowAggregate(createAcc, add, getResult)` | Aggregate with separate accumulator type | `WindowedStream.aggregate()` |
 | `windowProcess(Function<Window, Iterable>)` | Full window access with multiple outputs | `WindowedStream.process()` |
+| `windowApply(Function<Window<T>, R>)` | Transform each `Window<T>` into a single result | `AllWindowedStream.apply()` |
+| `windowCount()` | Emit the element count of each window | `WindowedStream.count()` |
 | `windowMin(Comparator)` | Minimum element of each window | — |
 | `windowMax(Comparator)` | Maximum element of each window | — |
 | `windowSum(ToDoubleFunction)` | Sum of each window | — |
@@ -129,19 +207,21 @@ PartitionResult<Integer> p = Stream.of(1, 2, 3, 4, 5)
 |---|---|---|
 | `split(classifier)` | Tag elements by string label | `DataStream.split()` |
 | `selectTag(tag)` | Filter `Tagged<T>` stream by tag | `SplitStream.select()` |
-| `connect(Iterable)` | Merge two-typed streams as `Tagged<Object>` | `DataStream.connect()` |
-| `coMap(mapLeft, mapRight)` | Map each side of a connected stream | `ConnectedStreams.map()` |
+| `connect(Iterable)` | Interleave main stream and another iterable as `Tagged<T>` with tags `"main"` and `"other"`; both sides are same-typed | `DataStream.connect()` |
+| `coMap(mapMain, mapOther)` | Map each side of a `Tagged<T>` stream by tag | `ConnectedStreams.map()` |
 | `union(Iterable)` | Concatenate another iterable after the stream | `DataStream.union()` |
 
 **Feasibility summary:**
 
 | Flink Concept | Gatherer Support | Notes |
 |---|---|---|
-| Tumbling / Sliding / Session / Global Window | Full | Count- and time-based |
-| KeyBy + Window + Reduce/Aggregate | Full | Per-key windowing |
+| Tumbling / Sliding / Session windows | Partial | Bounded streams, element-local timestamps, no triggers |
+| Global Window | Partial | Bounded; emits one window at stream end, no custom triggers |
+| KeyBy + Window + Reduce/Aggregate | Full | Per-key windowing on bounded streams |
 | ProcessWindowFunction | Full | Full window context |
-| Connect / CoMap | Partial | Via tagged union |
+| Connect / CoMap | Partial | Via tagged union of same-typed values |
 | Split / Side Output | Partial | Tag-based routing |
+| Union | Partial | Concatenates another iterable; not a true parallel union |
 | Event Time / Watermarks | Not feasible | Requires unbounded push model |
 | Checkpointing / Exactly-once | Not applicable | Single JVM, no distributed state |
 
@@ -171,6 +251,7 @@ Stream.of(new Event("A",1), new Event("B",10),
 
 > Only operators not already in Java `Stream` are implemented here.
 > Time-based operators use element-embedded timestamps (deterministic) rather than wall-clock time.
+> These gatherers simulate a subset of RxJava/Reactor semantics on bounded, pull-based streams.
 
 #### Timing Operators
 
@@ -189,9 +270,9 @@ Stream.of(new Event("A",1), new Event("B",10),
 | Operator | Description | RxJava / Reactor |
 |---|---|---|
 | `doOnNext(Consumer)` | Side-effect per element, pass through | `doOnNext` |
-| `doOnComplete(Runnable)` | Side-effect at stream end | `doOnComplete` |
-| `doOnError(Consumer<Throwable>)` | Observe and re-throw exceptions | `doOnError` |
-| `doFinally(Consumer<String>)` | Side-effect on any termination | `doFinally` |
+| `doOnComplete(Runnable)` | Side-effect at normal stream end | `doOnComplete` |
+| `doOnError(Consumer<Throwable>)` | Observe `RuntimeException` / `Error` thrown while pushing an element downstream, then re-throw; does not catch upstream map/filter errors | `doOnError` |
+| `doFinally(Consumer<String>)` | Side-effect only on normal completion, receiving the string `"complete"`; cannot observe errors because Java Streams have no error channel | `doFinally` |
 
 #### Error Handling Operators
 
@@ -210,7 +291,7 @@ Stream.of(new Event("A",1), new Event("B",10),
 | `switchIfEmpty(Iterable)` | Switch to fallback when stream is empty | `switchIfEmpty` |
 | `startWith(Iterable)` | Prepend iterable before stream | `startWith` |
 | `concatWith(Iterable)` | Append iterable after stream | `concatWith` |
-| `withLatestFrom(other, combiner)` | Combine with latest from another iterable | `withLatestFrom` |
+| `withLatestFrom(other, combiner)` | For each main element, consume one value from `other` and combine it with the latest `other` value seen so far; main elements received before `other` has produced any value are skipped; if `other` is shorter than the main stream, the last `other` value is reused for the remaining main elements | `withLatestFrom` |
 
 #### Selection Operators
 
@@ -222,7 +303,7 @@ Stream.of(new Event("A",1), new Event("B",10),
 | `skipLast(n)` | Skip last N elements | `skipLast` |
 | `takeLast(n)` | Take only last N elements | `takeLast` |
 | `distinctUntilChanged()` | Suppress consecutive duplicates | `distinctUntilChanged` |
-| `distinctUntilChanged(keyExtractor)` | Suppress consecutive duplicates by key | `distinctUntilChanged(keySelector)` |
+| `distinctUntilChanged(keyExtractor)` | Suppress consecutive duplicates by key | `distinctUntilChanged` |
 
 #### Aggregation Operators
 
@@ -231,7 +312,7 @@ Stream.of(new Event("A",1), new Event("B",10),
 | `scan(seed, accumulator)` | Scan with seed (includes seed in output) | `scan` |
 | `reduceWith(seed, accumulator)` | Reduce with seed, emit single result | `reduce` |
 | `collectList()` | Collect all elements into one `List` | `collectList` |
-| `mapWithIndex(combiner)` | Pair each element with its index | `index` |
+| `mapWithIndex(combiner)` | Pair each element with its index; the `BiFunction` receives `(Long index, T element)` | `index` |
 | `materialize()` | Wrap elements as `Notification<T>` | `materialize` |
 | `dematerialize()` | Unwrap `Notification<T>` stream | `dematerialize` |
 
@@ -277,11 +358,11 @@ src/
     sequence/   SequenceGatherersTest.java
     window/     WindowGatherersTest.java
     reactive/   ReactiveGatherersTest.java
-                StreamingOperatorTest.java   # virtual-thread streaming tests
+    StreamingOperatorTest.java   # virtual-thread streaming tests
 ```
 
 ---
 
 ## License
 
-[MIT](./LICENSE)
+[Apache-2.0](./LICENSE)
