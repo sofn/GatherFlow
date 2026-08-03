@@ -29,7 +29,7 @@ jobs:
       uses: gradle/actions/wrapper-validation@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
 
     - name: Set up JDK 25
-      uses: actions/setup-java@99b8673ff64fbf99d48d1e11e2c2b5ff3608851a # v4.7.0
+      uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4.7.0
       with:
         java-version: '25'
         distribution: 'temurin'
