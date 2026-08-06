@@ -20,6 +20,9 @@
 *.rar
 !gradle/wrapper/gradle-wrapper.jar
 
+# Gradle dependency verification binary keyring (use the .keys file instead)
+/gradle/verification-keyring.gpg
+
 # virtual machine crash logs, see http://www.java.com/en/download/help/error_hotspot.xml
 hs_err_pid*
 replay_pid*
