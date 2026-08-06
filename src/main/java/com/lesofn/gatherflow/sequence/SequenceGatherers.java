@@ -9,7 +9,7 @@ import java.util.stream.Stream;
  * Stream Gatherer operators inspired by Scala Collections API and Vavr.
  *
  * <p>Provides a rich set of intermediate stream operations built on top of
- * JDK 24's {@link Gatherer} API (JEP 485), simulating functional collection
+ * Java 25's {@link Gatherer} API (JEP 485), simulating functional collection
  * operators from Scala and Vavr.</p>
  *
  * <h3>Scala-inspired operators:</h3>
@@ -359,8 +359,8 @@ public final class SequenceGatherers {
                 },
                 (state, downstream) -> {
                     downstream.push(new PartitionResult<>(
-                            List.copyOf(state.matching),
-                            List.copyOf(state.nonMatching)
+                            Collections.unmodifiableList(new ArrayList<>(state.matching)),
+                            Collections.unmodifiableList(new ArrayList<>(state.nonMatching))
                     ));
                 }
         );
@@ -383,7 +383,9 @@ public final class SequenceGatherers {
         Objects.requireNonNull(mapper);
         return Gatherer.ofSequential(
                 (_, element, downstream) -> {
-                    for (R r : mapper.apply(element)) {
+                    Iterable<? extends R> iterable = Objects.requireNonNull(mapper.apply(element),
+                            "flatMap mapper returned null");
+                    for (R r : iterable) {
                         if (!downstream.push(r)) return false;
                     }
                     return true;
@@ -580,7 +582,7 @@ public final class SequenceGatherers {
                     state.acc = op.apply(state.acc, element);
                     return true;
                 },
-                (state, downstream) -> downstream.push(state.acc)
+                (state, downstream) -> { if (!downstream.push(state.acc)) return; }
         );
     }
 
@@ -762,7 +764,8 @@ public final class SequenceGatherers {
                 },
                 (state, downstream) -> {
                     Map<K, List<T>> result = new LinkedHashMap<>();
-                    state.map.forEach((k, v) -> result.put(k, List.copyOf(v)));
+                    state.map.forEach((k, v) -> result.put(k,
+                            Collections.unmodifiableList(new ArrayList<>(v))));
                     downstream.push(Collections.unmodifiableMap(result));
                 }
         );

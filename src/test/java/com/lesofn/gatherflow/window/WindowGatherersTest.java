@@ -262,6 +262,19 @@ class WindowGatherersTest {
             assertThrows(IllegalArgumentException.class,
                     () -> sessionWindow(-1, TimedEvent::ts));
         }
+
+        @Test
+        @DisplayName("handles Long.MIN_VALUE without overflow")
+        void handlesLongMinValue() {
+            List<Window<TimedEvent>> result = Stream.of(
+                    new TimedEvent(Long.MIN_VALUE, "a"),
+                    new TimedEvent(0, "b")
+            ).gather(sessionWindow(100, TimedEvent::ts))
+                    .toList();
+            assertEquals(2, result.size());
+            assertEquals(List.of(new TimedEvent(Long.MIN_VALUE, "a")), result.get(0).elements());
+            assertEquals(List.of(new TimedEvent(0, "b")), result.get(1).elements());
+        }
     }
 
     // ═══════════════════════════════════════════════
@@ -744,6 +757,27 @@ class WindowGatherersTest {
         @DisplayName("invalid size throws")
         void invalidSize() {
             assertThrows(IllegalArgumentException.class, () -> tumblingTimeWindow(0, TimedEvent::ts));
+        }
+
+        @Test
+        @DisplayName("negative timestamps align to floor buckets")
+        void negativeTimestamps() {
+            List<Window<TimedEvent>> result = Stream.of(
+                    new TimedEvent(-150, "a"),
+                    new TimedEvent(-50, "b"),
+                    new TimedEvent(50, "c")
+            ).gather(tumblingTimeWindow(100, TimedEvent::ts))
+                    .toList();
+            assertEquals(3, result.size());
+            assertEquals(-200, result.get(0).startIndex());
+            assertEquals(-101, result.get(0).endIndex());
+            assertEquals(List.of(new TimedEvent(-150, "a")), result.get(0).elements());
+            assertEquals(-100, result.get(1).startIndex());
+            assertEquals(-1, result.get(1).endIndex());
+            assertEquals(List.of(new TimedEvent(-50, "b")), result.get(1).elements());
+            assertEquals(0, result.get(2).startIndex());
+            assertEquals(99, result.get(2).endIndex());
+            assertEquals(List.of(new TimedEvent(50, "c")), result.get(2).elements());
         }
     }
 

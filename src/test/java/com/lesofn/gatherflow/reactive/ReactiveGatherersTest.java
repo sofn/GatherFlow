@@ -89,6 +89,17 @@ class ReactiveGatherersTest {
         void nullExtractor() {
             assertThrows(NullPointerException.class, () -> debounce(100, null));
         }
+
+        @Test
+        @DisplayName("handles Long.MIN_VALUE without overflow")
+        void handlesLongMinValue() {
+            List<TimedEvent> result = Stream.of(
+                    new TimedEvent(Long.MIN_VALUE, "a"),
+                    new TimedEvent(0, "b")
+            ).gather(debounce(100, TimedEvent::ts))
+                    .toList();
+            assertEquals(List.of(new TimedEvent(Long.MIN_VALUE, "a"), new TimedEvent(0, "b")), result);
+        }
     }
 
     // ═══════════════════════════════════════════════
@@ -439,6 +450,17 @@ class ReactiveGatherersTest {
         }
 
         @Test
+        @DisplayName("materialize preserves null elements")
+        void materializeNull() {
+            List<Notification<String>> result = Arrays.asList(null, "b").stream()
+                    .gather(ReactiveGatherers.<String>materialize())
+                    .toList();
+            assertEquals(3, result.size());
+            assertInstanceOf(Notification.OnNext.class, result.get(0));
+            assertNull(((Notification.OnNext<String>) result.get(0)).value());
+        }
+
+        @Test
         @DisplayName("dematerialize reverses materialize")
         void roundTrip() {
             List<String> result = Stream.of("a", "b", "c")
@@ -496,6 +518,17 @@ class ReactiveGatherersTest {
                     .gather(onErrorReturn(i -> i / 2, -1))
                     .toList();
             assertEquals(List.of(1, 2, 3), result);
+        }
+
+        @Test
+        @DisplayName("does not swallow downstream errors")
+        void doesNotSwallowDownstreamErrors() {
+            RuntimeException ex = assertThrows(RuntimeException.class, () ->
+                    Stream.of(1, 2, 3)
+                            .gather(onErrorReturn(i -> i, -1))
+                            .map(i -> { if (i == 2) throw new RuntimeException("downstream boom"); return i; })
+                            .toList());
+            assertEquals("downstream boom", ex.getMessage());
         }
     }
 
@@ -556,6 +589,19 @@ class ReactiveGatherersTest {
                     .toList();
             assertEquals(List.of("a"), result);
         }
+
+        @Test
+        @DisplayName("does not swallow downstream errors")
+        void doesNotSwallowDownstreamErrors() {
+            RuntimeException ex = assertThrows(RuntimeException.class, () ->
+                    Stream.of(1, 2, 3)
+                            .gather(onErrorResume(
+                                    i -> i,
+                                    e -> List.of(-1)))
+                            .map(i -> { if (i == 2) throw new RuntimeException("downstream boom"); return i; })
+                            .toList());
+            assertEquals("downstream boom", ex.getMessage());
+        }
     }
 
     // ═══════════════════════════════════════════════
@@ -612,6 +658,19 @@ class ReactiveGatherersTest {
         @DisplayName("negative maxRetries throws")
         void negativeRetries() {
             assertThrows(IllegalArgumentException.class, () -> retry(i -> i, -1));
+        }
+
+        @Test
+        @DisplayName("does not retry on downstream errors")
+        void doesNotRetryOnDownstreamErrors() {
+            AtomicInteger mapperCalls = new AtomicInteger();
+            RuntimeException ex = assertThrows(RuntimeException.class, () ->
+                    Stream.of(1, 2)
+                            .gather(retry(i -> { mapperCalls.incrementAndGet(); return i; }, 3))
+                            .map(i -> { throw new RuntimeException("downstream boom"); })
+                            .toList());
+            assertEquals("downstream boom", ex.getMessage());
+            assertEquals(1, mapperCalls.get(), "mapper should only be called once per element before downstream error");
         }
 
         @Test
@@ -855,6 +914,24 @@ class ReactiveGatherersTest {
         void negativeIndex() {
             assertThrows(IllegalArgumentException.class, () -> elementAt(-1));
         }
+
+        @Test
+        @DisplayName("toList emits exactly one optional")
+        void toListEmitsAtMostOne() {
+            List<Optional<String>> result = Stream.of("a", "b", "c", "d")
+                    .gather(elementAt(2))
+                    .toList();
+            assertEquals(List.of(Optional.of("c")), result);
+        }
+
+        @Test
+        @DisplayName("null element at index emits empty optional and no trailing empty")
+        void nullElementAtIndex() {
+            List<Optional<String>> result = Arrays.asList(null, "b").stream()
+                    .gather(elementAt(0))
+                    .toList();
+            assertEquals(List.of(Optional.empty()), result);
+        }
     }
 
     // ═══════════════════════════════════════════════
@@ -883,6 +960,24 @@ class ReactiveGatherersTest {
                     .findFirst()
                     .orElseThrow();
             assertTrue(result.isEmpty());
+        }
+
+        @Test
+        @DisplayName("toList emits exactly one optional")
+        void toListEmitsAtMostOne() {
+            List<Optional<Integer>> result = Stream.of(10, 20, 30)
+                    .gather(first())
+                    .toList();
+            assertEquals(List.of(Optional.of(10)), result);
+        }
+
+        @Test
+        @DisplayName("first null element emits empty optional and no trailing empty")
+        void firstNullElement() {
+            List<Optional<String>> result = Arrays.asList(null, "b").stream()
+                    .gather(first())
+                    .toList();
+            assertEquals(List.of(Optional.empty()), result);
         }
     }
 
@@ -1224,9 +1319,9 @@ class ReactiveGatherersTest {
     class NotificationTypeTest {
 
         @Test
-        @DisplayName("OnNext null value throws")
+        @DisplayName("OnNext null value is allowed")
         void onNextNull() {
-            assertThrows(NullPointerException.class, () -> new Notification.OnNext<>(null));
+            assertDoesNotThrow(() -> new Notification.OnNext<>(null));
         }
 
         @Test

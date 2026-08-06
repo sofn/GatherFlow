@@ -8,9 +8,8 @@ import java.util.Objects;
  */
 public sealed interface Notification<T> {
     /** An element notification (onNext). */
-    record OnNext<T>(T value) implements Notification<T> {
-        public OnNext { Objects.requireNonNull(value); }
-    }
+    record OnNext<T>(T value) implements Notification<T> {}
+
     /** An error notification (onError). */
     record OnError<T>(Throwable error) implements Notification<T> {
         public OnError { Objects.requireNonNull(error); }

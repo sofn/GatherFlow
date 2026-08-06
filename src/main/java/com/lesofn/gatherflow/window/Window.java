@@ -10,8 +10,8 @@ import java.util.List;
  *
  * @param <T> element type
  * @param windowId    sequential window identifier
- * @param startIndex  index of the first element in this window
- * @param endIndex    index of the last element in this window
+ * @param startIndex  index of the first element in this window; for time-based windows this is the interval start timestamp
+ * @param endIndex    index of the last element in this window; for time-based windows this is the inclusive interval end timestamp
  * @param elements    elements contained in this window
  */
 public record Window<T>(

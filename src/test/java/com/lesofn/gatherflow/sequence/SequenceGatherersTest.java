@@ -528,6 +528,16 @@ class SequenceGatherersTest {
             assertTrue(result.matching().isEmpty());
             assertTrue(result.nonMatching().isEmpty());
         }
+
+        @Test
+        @DisplayName("preserves null elements")
+        void preservesNull() {
+            PartitionResult<Integer> result = Arrays.asList(2, null, 4).stream()
+                    .gather(partition(x -> x != null && x % 2 == 0))
+                    .findFirst().orElseThrow();
+            assertEquals(List.of(2, 4), result.matching());
+            assertEquals(Collections.singletonList((Integer) null), result.nonMatching());
+        }
     }
 
     // ═══════════════════════════════════════════
@@ -563,6 +573,13 @@ class SequenceGatherersTest {
                     .gather(flatMap(x -> List.of(x, x)))
                     .toList();
             assertTrue(result.isEmpty());
+        }
+
+        @Test
+        @DisplayName("mapper returning null iterable throws NPE")
+        void mapperReturnsNull() {
+            assertThrows(NullPointerException.class,
+                    () -> Stream.of(1).gather(flatMap(x -> null)).toList());
         }
     }
 
@@ -1111,6 +1128,17 @@ class SequenceGatherersTest {
                     .gather(groupBy(String::length))
                     .findFirst().orElseThrow();
             assertThrows(UnsupportedOperationException.class, () -> result.put(1, List.of()));
+        }
+
+        @Test
+        @DisplayName("preserves null values")
+        void preservesNullValues() {
+            Map<Integer, List<String>> result = Arrays.asList("a", null, "bb").stream()
+                    .gather(groupBy(x -> x == null ? 0 : x.length()))
+                    .findFirst().orElseThrow();
+            assertEquals(List.of("a"), result.get(1));
+            assertEquals(Collections.singletonList((String) null), result.get(0));
+            assertEquals(List.of("bb"), result.get(2));
         }
     }
 

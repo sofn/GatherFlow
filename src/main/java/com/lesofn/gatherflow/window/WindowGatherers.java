@@ -8,7 +8,7 @@ import java.util.stream.Gatherer;
  * Flink-inspired Stream Gatherer operators.
  *
  * <p>Simulates Apache Flink's core stream processing abstractions using
- * JDK 24's {@link Gatherer} API (JEP 485). While Java Streams are bounded
+ * Java 25's {@link Gatherer} API (JEP 485). While Java Streams are bounded
  * and pull-based (unlike Flink's unbounded push-based model), these operators
  * faithfully replicate Flink's <em>semantics</em> on bounded data sets.</p>
  *
@@ -215,12 +215,14 @@ public final class WindowGatherers {
                     final List<T> buffer = new ArrayList<>();
                     long windowId = 0;
                     long windowStartIndex = 0;
-                    long lastTimestamp = Long.MIN_VALUE;
+                    long lastTimestamp;
                     long globalIndex = 0;
                 },
                 (state, element, downstream) -> {
                     long ts = timestampExtractor.applyAsLong(element);
-                    if (!state.buffer.isEmpty() && (ts - state.lastTimestamp) > gap) {
+                    if (!state.buffer.isEmpty()
+                            && ts > state.lastTimestamp
+                            && Long.compareUnsigned(ts - state.lastTimestamp, gap) > 0) {
                         // Gap exceeded — emit current session and start new one
                         if (!downstream.push(new Window<>(
                                 state.windowId,
@@ -684,7 +686,7 @@ public final class WindowGatherers {
                 },
                 (state, element, downstream) -> {
                     long ts = timestampExtractor.applyAsLong(element);
-                    long windowStart = (ts / size) * size; // align to size boundary
+                    long windowStart = Math.floorDiv(ts, size) * size; // align to size boundary
                     // When moving to a new window, emit all previous complete windows
                     if (state.lastWindowStart != Long.MIN_VALUE && windowStart > state.lastWindowStart) {
                         for (var entry : state.windows.entrySet()) {

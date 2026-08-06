@@ -7,7 +7,7 @@ import java.util.stream.Gatherer;
 /**
  * Reactive-style Stream Gatherer operators inspired by RxJava and Project Reactor.
  *
- * <p>Simulates RxJava/Reactor's core reactive abstractions using JDK 24's
+ * <p>Simulates RxJava/Reactor's core reactive abstractions using Java 25's
  * {@link Gatherer} API. Only operators that <em>do not already exist</em> in
  * {@link java.util.stream.Stream} are implemented here.</p>
  *
@@ -94,12 +94,14 @@ public final class ReactiveGatherers {
         return Gatherer.ofSequential(
                 () -> new Object() {
                     T pending;
-                    long pendingTs = Long.MIN_VALUE;
+                    long pendingTs;
                     boolean hasPending = false;
                 },
                 (state, element, downstream) -> {
                     long ts = timestampExtractor.applyAsLong(element);
-                    if (state.hasPending && (ts - state.pendingTs) > timeout) {
+                    if (state.hasPending
+                            && ts > state.pendingTs
+                            && Long.compareUnsigned(ts - state.pendingTs, timeout) > 0) {
                         if (!downstream.push(state.pending)) {
                             return false;
                         }
@@ -393,14 +395,16 @@ public final class ReactiveGatherers {
     }
 
     /**
-     * Invoke a side-effect when the stream terminates, regardless of
-     * normal completion or error. The action receives the notification type.
+     * Invoke a side-effect when the stream terminates normally or via
+     * short-circuit. The action is currently only invoked with {@code "complete"};
+     * Java Streams propagate errors as exceptions, so the Gatherer API has no
+     * error-path callback.
      *
      * <p>RxJava: {@code observable.doFinally(action)}</p>
      * <p>Reactor: {@code flux.doFinally(action)}</p>
      *
-     * @param action  side-effect to perform on termination, receives "complete" or "error"
-     * @return a Gatherer that invokes the action on any termination
+     * @param action  side-effect to perform on normal completion, receives "complete"
+     * @return a Gatherer that invokes the action on normal completion
      */
     public static <T> Gatherer<T, ?, T> doFinally(Consumer<String> action) {
         Objects.requireNonNull(action);
@@ -482,11 +486,13 @@ public final class ReactiveGatherers {
         Objects.requireNonNull(mapper);
         return Gatherer.ofSequential(
                 (_, element, downstream) -> {
+                    R mapped;
                     try {
-                        return downstream.push(mapper.apply(element));
+                        mapped = mapper.apply(element);
                     } catch (RuntimeException | Error e) {
                         return downstream.push(fallback);
                     }
+                    return downstream.push(mapped);
                 }
         );
     }
@@ -515,8 +521,9 @@ public final class ReactiveGatherers {
         Objects.requireNonNull(fallbackFactory);
         return Gatherer.ofSequential(
                 (_, element, downstream) -> {
+                    R mapped;
                     try {
-                        return downstream.push(mapper.apply(element));
+                        mapped = mapper.apply(element);
                     } catch (RuntimeException | Error e) {
                         Iterable<? extends R> fallback;
                         if (e instanceof RuntimeException re) {
@@ -530,6 +537,7 @@ public final class ReactiveGatherers {
                         }
                         return true;
                     }
+                    return downstream.push(mapped);
                 }
         );
     }
@@ -562,11 +570,14 @@ public final class ReactiveGatherers {
                 (_, element, downstream) -> {
                     Throwable lastException = null;
                     for (int attempt = 0; attempt <= maxRetries; attempt++) {
+                        R mapped;
                         try {
-                            return downstream.push(mapper.apply(element));
+                            mapped = mapper.apply(element);
                         } catch (RuntimeException | Error e) {
                             lastException = e;
+                            continue;
                         }
+                        return downstream.push(mapped);
                     }
                     if (lastException instanceof RuntimeException re) throw re;
                     if (lastException instanceof Error er) throw er;
@@ -784,17 +795,20 @@ public final class ReactiveGatherers {
     public static <T> Gatherer<T, ?, Optional<T>> elementAt(long index) {
         if (index < 0) throw new IllegalArgumentException("index must be >= 0, got " + index);
         return Gatherer.ofSequential(
-                () -> new Object() { long currentIndex = 0; },
+                () -> new Object() { long currentIndex = 0; boolean found = false; },
                 (state, element, downstream) -> {
                     if (state.currentIndex == index) {
+                        state.found = true;
                         downstream.push(Optional.ofNullable(element));
-                        return false; // short-circuit
+                        return false; // short-circuit after found
                     }
                     state.currentIndex++;
                     return true;
                 },
                 (state, downstream) -> {
-                    downstream.push(Optional.empty());
+                    if (!state.found) {
+                        if (!downstream.push(Optional.empty())) return;
+                    }
                 }
         );
     }
@@ -813,12 +827,16 @@ public final class ReactiveGatherers {
      */
     public static <T> Gatherer<T, ?, Optional<T>> first() {
         return Gatherer.ofSequential(
-                (_, element, downstream) -> {
+                () -> new Object() { boolean found = false; },
+                (state, element, downstream) -> {
+                    state.found = true;
                     downstream.push(Optional.ofNullable(element));
                     return false; // short-circuit after first
                 },
-                (_, downstream) -> {
-                    downstream.push(Optional.empty());
+                (state, downstream) -> {
+                    if (!state.found) {
+                        if (!downstream.push(Optional.empty())) return;
+                    }
                 }
         );
     }
@@ -845,9 +863,9 @@ public final class ReactiveGatherers {
                 },
                 (state, downstream) -> {
                     if (state.hasElement) {
-                        downstream.push(Optional.ofNullable(state.lastElement));
+                        if (!downstream.push(Optional.ofNullable(state.lastElement))) return;
                     } else {
-                        downstream.push(Optional.empty());
+                        if (!downstream.push(Optional.empty())) return;
                     }
                 }
         );
@@ -1067,7 +1085,7 @@ public final class ReactiveGatherers {
                     state.acc = accumulator.apply(state.acc, element);
                     return true;
                 },
-                (state, downstream) -> downstream.push(state.acc)
+                (state, downstream) -> { if (!downstream.push(state.acc)) return; }
         );
     }
 
@@ -1089,7 +1107,7 @@ public final class ReactiveGatherers {
                     state.buffer.add(element);
                     return true;
                 },
-                (state, downstream) -> downstream.push(Collections.unmodifiableList(new ArrayList<>(state.buffer)))
+                (state, downstream) -> { if (!downstream.push(Collections.unmodifiableList(new ArrayList<>(state.buffer)))) return; }
         );
     }
 
